@@ -24,5 +24,8 @@ export const api = {
   listProjects: () => request('/api/projects'),
   getProject: (id) => request('/api/projects/' + id),
   getEvents: (id) => request('/api/projects/' + id + '/events'),
-  previewUrl: (id) => BASE + '/api/projects/' + id + '/preview'
+  // 预览接口由 iframe 直接加载，无法携带 Authorization 头，
+  // 与 SSE 一样通过 t 查询参数传递 token（后端中间件支持）。
+  previewUrl: (id) => BASE + '/api/projects/' + id + '/preview?t=' +
+    encodeURIComponent(localStorage.getItem('atomix_token') || '')
 }

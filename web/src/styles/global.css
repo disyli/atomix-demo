@@ -1,26 +1,64 @@
+/* Atoms 视觉体系 —— 浅色米白底 + 品牌蓝 + 胶囊圆角 + Inter */
 :root {
-  --bg: #0b1120;
-  --panel: #111a2e;
-  --panel-2: #16213a;
-  --border: #24304d;
-  --text: #e2e8f0;
-  --muted: #8ea0bf;
-  --accent: #6366f1;
-  --accent-2: #38bdf8;
-  --ok: #34d399;
-  --warn: #fbbf24;
-  --err: #f87171;
+  /* 品牌色板（取自 Atoms 设计 token） */
+  --beige-50: #ffffff;
+  --beige-100: #f6f6f6;
+  --beige-150: #f1f1f1;
+  --beige-200: #ebebea;
+  --beige-300: #e1e0e0;
+
+  --ink-100: #0c0c0c;            /* 主文字 墨黑 */
+  --ink-80: rgba(12, 12, 12, .8);
+  --ink-55: rgba(12, 12, 12, .55);
+  --ink-30: rgba(12, 12, 12, .3);
+  --line: rgba(12, 12, 12, .12);
+  --line-soft: rgba(12, 12, 12, .06);
+
+  --blue-500: #4267ff;           /* 品牌主色 */
+  --blue-600: #425ce1;           /* 深压 / hover */
+  --blue-100: #dde7ff;
+  --blue-50: #ecf1ff;
+
+  --green: #2dbb5c;
+  --orange: #efae22;
+  --red: #c9444a;
+
+  /* 语义别名 */
+  --bg: var(--beige-100);
+  --panel: var(--beige-50);
+  --panel-2: var(--beige-150);
+  --text: var(--ink-100);
+  --muted: var(--ink-55);
+  --border: var(--line);
+  --accent: var(--blue-500);
+  --accent-2: var(--blue-600);
+
+  /* 圆角 */
+  --r-s: 8px;
+  --r-m: 12px;
+  --r-l: 16px;
+  --r-full: 999px;
+
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, "PingFang SC",
+    "Noto Sans", "Helvetica Neue", "Microsoft YaHei", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
+
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body, #app { height: 100%; }
 body {
-  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: var(--font-sans);
   background: var(--bg);
   color: var(--text);
+  font-size: 15px;
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
-button { font-family: inherit; cursor: pointer; border: none; }
+button { font-family: inherit; cursor: pointer; border: none; background: none; color: inherit; }
 input, textarea, select { font-family: inherit; }
-::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-thumb { background: #2b3a5c; border-radius: 4px; }
+a { color: var(--accent); text-decoration: none; }
+::selection { background: var(--blue-100); }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--beige-300); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
 ::-webkit-scrollbar-track { background: transparent; }

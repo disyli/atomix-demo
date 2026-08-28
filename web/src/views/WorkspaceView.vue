@@ -51,7 +51,7 @@ init()
 async function init() {
   try {
     const health = await fetch('/api/health').then(r => r.json())
-    serverMode.value = health.mode === 'live' ? 'DeepSeek 已接入' : '演示模式（未配置 Key）'
+    serverMode.value = health.mode === 'live' ? 'DeepSeek 已接入' : '演示模式'
   } catch { serverMode.value = '' }
   await loadProjects()
   await nextTick(); scrollTimeline()
@@ -128,7 +128,11 @@ async function openProject(p) {
   <div class="ws">
     <!-- 顶栏 -->
     <header class="topbar">
-      <div class="brand">⚛️ <b>Atomix</b> <span class="badge-demo">{{ serverMode }}</span></div>
+      <div class="brand">
+        <span class="mark">A</span>
+        <span class="name">Atomix</span>
+        <span class="badge" :class="serverMode === 'DeepSeek 已接入' ? 'live' : 'demo'">{{ serverMode }}</span>
+      </div>
       <div class="user">
         <span class="avatar">{{ (user.email || '?')[0].toUpperCase() }}</span>
         <span class="email">{{ user.email }}</span>
@@ -140,11 +144,14 @@ async function openProject(p) {
       <!-- 左栏：对话 + 时间线 -->
       <section class="left">
         <div class="panel input-panel">
-          <div class="panel-title">描述你想构建的应用</div>
+          <div class="panel-title">
+            <span class="pt-zh">描述你的想法</span>
+            <span class="pt-mono">Tell Atomix your idea</span>
+          </div>
           <textarea
             v-model="brief"
             rows="3"
-            placeholder="例：做一个番茄钟计时器…（内置模板覆盖：待办清单 / 便签墙 / 项目看板）"
+            placeholder="几分钟即可上线，不用等几周。例如：做一个番茄钟计时器…"
             :disabled="running"
             @keydown.ctrl.enter="generate"
             @keydown.meta.enter="generate"
@@ -153,8 +160,12 @@ async function openProject(p) {
             <div class="examples">
               <button v-for="x in examples" :key="x" class="chip" :disabled="running" @click="brief = x">{{ x }}</button>
             </div>
+          </div>
+          <div class="row submit-row">
+            <span class="kbd-hint">⌘ + Enter 发送</span>
             <button class="go" :disabled="running || !brief.trim()" @click="generate">
-              {{ running ? '构建中…' : '⚡ 开始生成' }}
+              {{ running ? '构建中…' : '开始' }}
+              <svg v-if="!running" viewBox="0 0 16 16" width="14" height="14" fill="none"><path d="M2 8h10M8.5 3.5 13 8l-4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
             </button>
           </div>
         </div>
@@ -168,20 +179,23 @@ async function openProject(p) {
               class="stage"
               :class="stageState[s]"
             >
-              <span class="dot"></span>
               <span class="icon">{{ stageMeta[s].icon }}</span>
               <span>{{ stageMeta[s].label }}</span>
             </div>
-            <div class="progress"><div :style="{ width: stageProgress + '%' }"></div></div>
           </div>
+          <div class="progress"><div :style="{ width: stageProgress + '%' }"></div></div>
         </div>
 
         <!-- 时间线 -->
         <div class="panel timeline-panel">
-          <div class="panel-title">Agent 执行时间线</div>
+          <div class="panel-title">
+            <span class="pt-zh">Agent 执行</span>
+            <span class="pt-mono">Agent execution</span>
+          </div>
           <div ref="timelineBox" class="timeline">
             <div v-if="!timeline.length && !running" class="empty-tip">
-              左侧输入需求后，Agent 的每一步执行都会实时展示在这里。
+              <div class="empty-mono">agent · team · build</div>
+              输入需求后，AI 团队的每一步执行都会实时展示在这里。
             </div>
             <div
               v-for="(t, i) in timeline"
@@ -209,14 +223,15 @@ async function openProject(p) {
 
         <div v-show="rightTab === 'preview'" class="preview-wrap">
           <div v-if="!activeProject" class="empty-tip big">
-            <div class="big-icon">🛠️</div>
-            还没有生成的应用<br /><span>输入需求，让 Agent 为你构建第一个应用</span>
+            <div class="big-mono">// ready to build</div>
+            还没有生成的应用
+            <span>告诉 Atomix 你的想法，让 AI 团队为你构建第一个应用</span>
           </div>
           <template v-else>
             <div class="preview-head">
               <b>{{ activeProject.name }}</b>
               <span class="meta">{{ activeProject.template }} · {{ activeProject.status }}</span>
-              <a :href="previewUrl" target="_blank" class="ghost">新窗口打开 ↗</a>
+              <a :href="previewUrl" target="_blank" class="open-link">新窗口打开 ↗</a>
             </div>
             <iframe
               v-if="previewUrl"
@@ -229,8 +244,9 @@ async function openProject(p) {
 
         <div v-show="rightTab === 'history'" class="history-wrap">
           <div v-if="!projects.length" class="empty-tip big">
-            <div class="big-icon">📦</div>
-            暂无历史项目<br /><span>生成的应用会持久化保存，可随时回看</span>
+            <div class="big-mono">// empty</div>
+            暂无历史项目
+            <span>生成的应用会持久化保存，可随时回看</span>
           </div>
           <div
             v-for="p in projects"
@@ -253,192 +269,246 @@ async function openProject(p) {
 </template>
 
 <style scoped>
-.ws { height: 100%; display: flex; flex-direction: column; }
+/* ============ 布局骨架 ============ */
+.ws { height: 100%; display: flex; flex-direction: column; background: var(--beige-100); }
+.main { flex: 1; display: flex; min-height: 0; }
+
+/* ============ 顶栏：浅色半透明 + 细线 ============ */
 .topbar {
-  height: 56px;
+  height: 58px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 20px;
-  border-bottom: 1px solid var(--border);
-  background: var(--panel);
+  padding: 0 22px;
+  background: rgba(246, 246, 246, .78);
+  backdrop-filter: saturate(180%) blur(10px);
+  border-bottom: 1px solid var(--line-soft);
   flex-shrink: 0;
+  z-index: 5;
 }
-.brand { font-size: 17px; display: flex; align-items: center; gap: 8px; }
-.badge-demo {
+.brand { display: flex; align-items: center; gap: 10px; }
+.mark {
+  width: 27px; height: 27px; border-radius: 9px;
+  background: var(--blue-500);
+  color: #fff; font-weight: 800; font-size: 15px;
+  display: flex; align-items: center; justify-content: center;
+}
+.name { font-weight: 700; font-size: 16.5px; letter-spacing: -.01em; }
+.badge {
   font-size: 11px;
-  color: var(--accent-2);
-  background: rgba(56,189,248,.1);
-  border: 1px solid rgba(56,189,248,.3);
-  padding: 2px 8px;
-  border-radius: 999px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  padding: 3px 10px;
+  border-radius: var(--r-full);
 }
-.user { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+.badge.demo { color: var(--ink-55); background: var(--beige-150); border: 1px solid var(--line-soft); }
+.badge.live { color: var(--green); background: rgba(45, 187, 92, .1); border: 1px solid rgba(45, 187, 92, .25); }
+
+.user { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--ink-55); }
 .avatar {
-  width: 28px; height: 28px; border-radius: 50%;
-  background: linear-gradient(135deg, var(--accent), #8b5cf6);
+  width: 29px; height: 29px; border-radius: 50%;
+  background: var(--blue-500);
   display: flex; align-items: center; justify-content: center;
   color: #fff; font-weight: 700; font-size: 13px;
 }
 .ghost {
-  background: transparent; color: var(--muted);
-  border: 1px solid var(--border); border-radius: 8px;
-  padding: 5px 12px; font-size: 12px;
+  color: var(--ink-55);
+  border: 1px solid var(--line);
+  border-radius: var(--r-full);
+  padding: 6px 14px; font-size: 12.5px; font-weight: 500;
+  transition: all .18s ease;
 }
-.ghost:hover { color: var(--text); border-color: var(--muted); }
-.main { flex: 1; display: flex; min-height: 0; }
+.ghost:hover { color: var(--ink-100); border-color: var(--ink-30); background: var(--beige-50); }
 
+/* ============ 左栏 ============ */
 .left {
-  width: 46%;
-  min-width: 420px;
+  width: 44%;
+  min-width: 400px;
   display: flex;
   flex-direction: column;
   gap: 12px;
   padding: 16px;
-  border-right: 1px solid var(--border);
+  border-right: 1px solid var(--line-soft);
   min-height: 0;
 }
 .panel {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 14px;
+  background: var(--beige-50);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-l);
+  padding: 16px;
 }
-.panel-title { font-size: 13px; color: var(--muted); margin-bottom: 10px; font-weight: 600; }
+.panel-title {
+  display: flex; align-items: baseline; gap: 10px;
+  font-size: 14px; font-weight: 700; color: var(--ink-100);
+  margin-bottom: 12px; letter-spacing: -.01em;
+}
+.pt-mono { font-family: var(--font-mono); font-size: 11px; font-weight: 400; color: var(--ink-30); }
+
+/* 输入面板 */
 .input-panel { flex-shrink: 0; }
 textarea {
   width: 100%;
-  background: var(--panel-2);
-  border: 1.5px solid var(--border);
-  border-radius: 10px;
-  color: var(--text);
-  padding: 12px;
-  font-size: 14px;
+  background: var(--beige-100);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-m);
+  color: var(--ink-100);
+  padding: 13px 14px;
+  font-size: 14.5px;
   resize: vertical;
   outline: none;
-  transition: border-color .2s;
+  transition: border-color .18s ease, background .18s ease;
 }
-textarea:focus { border-color: var(--accent); }
-.row { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; margin-top: 10px; }
+textarea::placeholder { color: var(--ink-30); }
+textarea:focus { background: var(--beige-50); border-color: var(--blue-500); }
+.row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
 .examples { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; }
 .chip {
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  color: var(--muted);
-  border-radius: 999px;
-  padding: 5px 11px;
+  background: var(--beige-50);
+  border: 1px solid var(--line-soft);
+  color: var(--ink-55);
+  border-radius: var(--r-full);
+  padding: 6px 13px;
   font-size: 12px;
-  transition: all .2s;
+  transition: all .18s ease;
   text-align: left;
 }
-.chip:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.chip:hover:not(:disabled) { color: var(--ink-100); border-color: var(--ink-30); }
+.chip:disabled { opacity: .5; cursor: default; }
+.submit-row { justify-content: space-between; }
+.kbd-hint { font-size: 11.5px; color: var(--ink-30); font-family: var(--font-mono); }
 .go {
-  background: linear-gradient(135deg, var(--accent), #8b5cf6);
+  display: inline-flex; align-items: center; gap: 7px;
+  background: var(--blue-500);
   color: #fff;
-  border-radius: 10px;
-  padding: 10px 18px;
-  font-weight: 700;
-  font-size: 14px;
+  border-radius: var(--r-full);
+  padding: 11px 20px;
+  font-weight: 600;
+  font-size: 14.5px;
   white-space: nowrap;
-  transition: opacity .2s;
+  transition: background .18s ease, transform .12s ease;
 }
-.go:disabled { opacity: .5; cursor: default; }
+.go:hover:not(:disabled) { background: var(--blue-600); }
+.go:active:not(:disabled) { transform: scale(.97); }
+.go:disabled { background: var(--beige-300); color: var(--beige-50); cursor: default; }
 
-.stages-panel { flex-shrink: 0; }
-.stages { display: flex; align-items: center; gap: 4px; position: relative; }
+/* 阶段进度 */
+.stages-panel { flex-shrink: 0; padding: 12px 16px; }
+.stages { display: flex; align-items: center; gap: 4px; }
 .stage {
   flex: 1;
   display: flex; align-items: center; justify-content: center; gap: 6px;
-  font-size: 12.5px; color: var(--muted);
-  padding: 8px 0; border-radius: 9px;
-  transition: all .25s;
+  font-size: 12.5px; color: var(--ink-30);
+  padding: 8px 0; border-radius: var(--r-full);
+  transition: all .25s ease;
+  font-weight: 500;
 }
-.stage .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border); transition: all .25s; }
-.stage.active { background: rgba(99,102,241,.14); color: var(--text); }
-.stage.active .dot { background: var(--accent); box-shadow: 0 0 8px var(--accent); animation: pulse 1.2s infinite; }
-.stage.done { color: var(--ok); }
-.stage.done .dot { background: var(--ok); }
-@keyframes pulse { 50% { opacity: .4; } }
+.stage.active { background: var(--blue-50); color: var(--blue-600); font-weight: 700; }
+.stage.done { color: var(--green); }
 .progress {
-  position: absolute; bottom: 0; left: 8px; right: 8px; height: 2px;
-  background: var(--border); border-radius: 1px; overflow: hidden;
+  margin-top: 10px; height: 4px;
+  background: var(--beige-150); border-radius: 999px; overflow: hidden;
 }
-.progress > div { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .4s; }
+.progress > div { height: 100%; background: var(--blue-500); border-radius: 999px; transition: width .4s ease; }
 
+/* 时间线 */
 .timeline-panel { flex: 1; display: flex; flex-direction: column; min-height: 0; }
-.timeline { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding-right: 4px; }
+.timeline { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 5px; padding-right: 4px; }
 .tl-item {
-  display: flex; align-items: baseline; gap: 8px;
+  display: flex; align-items: baseline; gap: 9px;
   font-size: 12.5px;
-  padding: 6px 9px;
-  border-radius: 8px;
-  background: var(--panel-2);
+  padding: 8px 12px;
+  border-radius: var(--r-s);
+  background: var(--beige-100);
 }
-.tl-item.stage { background: rgba(99,102,241,.14); font-weight: 600; }
-.tl-item.warn { background: rgba(251,191,36,.1); }
-.tl-item.err { background: rgba(248,113,113,.12); color: var(--err); }
-.tl-stage { color: var(--accent-2); font-size: 11px; flex-shrink: 0; }
-.tl-msg { flex: 1; color: var(--text); }
-.tl-item.stage .tl-msg { color: #fff; }
-.tl-time { color: var(--muted); font-size: 11px; flex-shrink: 0; }
-.empty-tip { color: var(--muted); font-size: 13px; padding: 24px 0; text-align: center; }
-.empty-tip.big { padding: 70px 0; line-height: 2; font-size: 14px; }
-.big-icon { font-size: 42px; margin-bottom: 6px; }
-.empty-tip span { font-size: 12px; opacity: .7; }
+.tl-item.stage { background: var(--blue-50); font-weight: 600; color: var(--blue-600); }
+.tl-item.warn { background: rgba(239, 174, 34, .1); color: #a87707; }
+.tl-item.err { background: rgba(201, 68, 74, .08); color: var(--red); }
+.tl-stage { color: var(--ink-30); font-size: 11px; flex-shrink: 0; font-family: var(--font-mono); }
+.tl-item.stage .tl-stage { color: var(--blue-500); }
+.tl-msg { flex: 1; color: var(--ink-80); }
+.tl-item.stage .tl-msg { color: var(--blue-600); }
+.tl-time { color: var(--ink-30); font-size: 11px; flex-shrink: 0; font-family: var(--font-mono); }
+.empty-tip { color: var(--ink-55); font-size: 13px; padding: 30px 0; text-align: center; }
+.empty-mono { font-family: var(--font-mono); font-size: 12px; color: var(--ink-30); margin-bottom: 8px; }
 
-.right { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+/* ============ 右栏 ============ */
+.right { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 16px 16px 16px 0; }
 .tabs {
-  display: flex; gap: 4px; padding: 12px 16px 0;
+  display: flex; gap: 6px;
+  background: var(--beige-150);
+  border-radius: var(--r-full);
+  padding: 4px;
+  align-self: flex-start;
+  margin-bottom: 12px;
 }
 .tabs button {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-bottom: none;
-  color: var(--muted);
-  padding: 9px 18px;
-  border-radius: 10px 10px 0 0;
+  color: var(--ink-55);
+  padding: 8px 18px;
+  border-radius: var(--r-full);
   font-size: 13px;
+  font-weight: 600;
+  transition: all .18s ease;
 }
-.tabs button.active { color: var(--text); background: var(--panel-2); }
+.tabs button.active { background: var(--beige-50); color: var(--ink-100); box-shadow: 0 1px 3px rgba(12,12,12,.08); }
 .tabs .count {
-  background: var(--accent); color: #fff; font-size: 11px;
-  border-radius: 999px; padding: 1px 7px; margin-left: 4px;
+  background: var(--beige-200); color: var(--ink-80); font-size: 11px; font-weight: 700;
+  border-radius: var(--r-full); padding: 1px 8px; margin-left: 5px;
 }
+.tabs button.active .count { background: var(--blue-500); color: #fff; }
+
 .preview-wrap, .history-wrap {
-  flex: 1; margin: 0 16px 16px;
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 0 14px 14px 14px;
+  flex: 1;
+  background: var(--beige-50);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-l);
   min-height: 0;
   display: flex; flex-direction: column;
-  overflow-y: auto;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(12,12,12,.03);
 }
+.history-wrap { overflow-y: auto; }
+.empty-tip.big {
+  padding: 80px 20px; line-height: 2; font-size: 15px; font-weight: 600; color: var(--ink-80);
+}
+.empty-tip.big span { display: block; font-size: 13px; font-weight: 400; color: var(--ink-55); }
+.big-mono { font-family: var(--font-mono); font-size: 13px; color: var(--ink-30); margin-bottom: 10px; }
 .preview-head {
   display: flex; align-items: center; gap: 10px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border);
-  font-size: 14px;
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 14.5px;
 }
-.preview-head .meta { color: var(--muted); font-size: 12px; }
-.preview-head .ghost { margin-left: auto; }
-.preview-frame { flex: 1; width: 100%; border: none; background: #fff; border-radius: 0 0 14px 14px; }
+.preview-head .meta { color: var(--ink-30); font-size: 12px; font-family: var(--font-mono); }
+.open-link {
+  margin-left: auto;
+  color: var(--blue-500); font-size: 12.5px; font-weight: 600;
+  border: 1px solid rgba(66, 103, 255, .3);
+  border-radius: var(--r-full);
+  padding: 6px 14px;
+  transition: all .18s ease;
+}
+.open-link:hover { background: var(--blue-50); border-color: var(--blue-500); }
+.preview-frame { flex: 1; width: 100%; border: none; background: #fff; }
+
+/* 历史卡片 */
 .proj-card {
-  padding: 14px 16px;
-  border-bottom: 1px solid var(--border);
+  padding: 15px 18px;
+  border-bottom: 1px solid var(--line-soft);
   cursor: pointer;
-  transition: background .15s;
+  transition: background .15s ease;
 }
-.proj-card:hover { background: rgba(99,102,241,.06); }
-.proj-card.active { background: rgba(99,102,241,.12); }
-.proj-name { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+.proj-card:hover { background: var(--beige-100); }
+.proj-card.active { background: var(--blue-50); }
+.proj-name { font-weight: 700; font-size: 14.5px; margin-bottom: 4px; color: var(--ink-100); }
 .proj-brief {
-  color: var(--muted); font-size: 12.5px;
+  color: var(--ink-55); font-size: 12.5px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  margin-bottom: 8px;
+  margin-bottom: 9px;
 }
-.proj-meta { display: flex; gap: 10px; align-items: center; font-size: 11.5px; color: var(--muted); }
+.proj-meta { display: flex; gap: 10px; align-items: center; font-size: 11.5px; color: var(--ink-30); font-family: var(--font-mono); }
 .tag {
-  background: rgba(99,102,241,.15); color: var(--accent-2);
-  padding: 1px 9px; border-radius: 999px; font-size: 11px;
+  background: var(--blue-50); color: var(--blue-600);
+  padding: 2px 10px; border-radius: var(--r-full); font-size: 11px; font-weight: 600;
+  font-family: var(--font-sans);
 }
 </style>
