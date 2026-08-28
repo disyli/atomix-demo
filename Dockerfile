@@ -8,6 +8,7 @@ RUN npm run build
 
 # 运行阶段
 FROM golang:1.25-alpine AS build
+RUN apk add --no-cache gcc musl-dev
 WORKDIR /src
 COPY server/go.mod server/go.sum ./
 RUN go mod download
