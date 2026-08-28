@@ -1,0 +1,25 @@
+# bin
+server/atomix
+server/static/
+
+# data
+server/data/
+*.db
+
+# node
+web/node_modules/
+web/dist/
+
+# env & secrets
+.env
+.env.*
+*.env
+
+# os
+.DS_Store
+Thumbs.db
+
+# ide
+.idea/
+.vscode/
+*.swp
