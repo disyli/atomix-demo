@@ -26,6 +26,13 @@ export const api = {
   getEvents: (id) => request('/api/projects/' + id + '/events'),
   // 预览接口由 iframe 直接加载，无法携带 Authorization 头，
   // 与 SSE 一样通过 t 查询参数传递 token（后端中间件支持）。
-  previewUrl: (id) => BASE + '/api/projects/' + id + '/preview?t=' +
-    encodeURIComponent(localStorage.getItem('atomix_token') || '')
+  // payload 为应用历史数据（键值对），经 location.hash 传给沙箱内存储垫片。
+  previewUrl: (id, payload) => {
+    let url = BASE + '/api/projects/' + id + '/preview?t=' +
+      encodeURIComponent(localStorage.getItem('atomix_token') || '')
+    if (payload && Object.keys(payload).length) {
+      url += '#atomix-data=' + encodeURIComponent(JSON.stringify(payload))
+    }
+    return url
+  }
 }

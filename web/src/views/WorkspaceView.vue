@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, nextTick } from 'vue'
+import { ref, computed, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { api } from '../api'
 
 /* ---------- 用户 ---------- */
@@ -98,7 +98,7 @@ function generate() {
     try {
       const data = JSON.parse(e.data)
       activeProject.value = data.project
-      previewUrl.value = api.previewUrl(data.project.id)
+      previewUrl.value = api.previewUrl(data.project.id, readAppData(data.project.id))
       rightTab.value = 'preview'
     } catch {}
     stageState.value['done'] = 'done'
@@ -116,12 +116,38 @@ function generate() {
 }
 
 /* ---------- 历史项目 ---------- */
+const APP_DATA_PREFIX = 'atomix_app_'
+function readAppData(projectId) {
+  try {
+    return JSON.parse(localStorage.getItem(APP_DATA_PREFIX + projectId) || '{}')
+  } catch { return {} }
+}
+
+/* 沙箱存储垫片消息：产物在 iframe 内的写入回传父页面持久化 */
+function onShimMessage(e) {
+  const d = e.data
+  if (!d || d.source !== 'atomix-shim' || !activeProject.value) return
+  if (d.type === 'storage') {
+    const key = APP_DATA_PREFIX + activeProject.value.id
+    let data = {}
+    try { data = JSON.parse(localStorage.getItem(key) || '{}') } catch {}
+    if (d.value === null) delete data[d.key]
+    else data[d.key] = d.value
+    localStorage.setItem(key, JSON.stringify(data))
+  } else if (d.type === 'clear') {
+    localStorage.removeItem(APP_DATA_PREFIX + activeProject.value.id)
+  }
+}
+
 async function openProject(p) {
   activeProject.value = p
-  previewUrl.value = api.previewUrl(p.id)
+  previewUrl.value = api.previewUrl(p.id, readAppData(p.id))
   rightTab.value = 'preview'
   try { activeEvents.value = await api.getEvents(p.id) } catch { activeEvents.value = [] }
 }
+
+onMounted(() => window.addEventListener('message', onShimMessage))
+onBeforeUnmount(() => window.removeEventListener('message', onShimMessage))
 </script>
 
 <template>
@@ -231,7 +257,7 @@ async function openProject(p) {
             <div class="preview-head">
               <b>{{ activeProject.name }}</b>
               <span class="meta">{{ activeProject.template }} · {{ activeProject.status }}</span>
-              <a :href="previewUrl" target="_blank" class="open-link">新窗口打开 ↗</a>
+              <a v-if="previewUrl" :href="previewUrl" target="_blank" class="open-link">新窗口打开 ↗</a>
             </div>
             <iframe
               v-if="previewUrl"
