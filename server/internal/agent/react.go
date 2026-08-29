@@ -226,7 +226,7 @@ func (rt *reactSession) liveRun(ctx context.Context) error {
 		shouldStop := false
 		for _, tc := range resp.ToolCalls {
 			// 权限网关：ask 级工具先向用户推送确认卡片，拒绝/超时则拦截并把结果回喂模型
-			allowed, denyMsg := rt.perm.authorize(tc.Function.Name, permissionDetail(tc.Function.Name, tc.Function.Arguments), rt.ev)
+			allowed, denyMsg := rt.perm.authorize(tc.Function.Name, permissionDetail(rt, tc.Function.Name, tc.Function.Arguments), rt.ev)
 			if !allowed {
 				messages = append(messages, llm.ChatMessage{Role: "tool", Content: denyMsg, ToolCallID: tc.ID})
 				rt.detail("observe", fmt.Sprintf("[%s] 权限拦截：%s", tc.Function.Name, truncateText(denyMsg, 120)), "warn")
@@ -383,20 +383,64 @@ func toolActionText(name, argsJSON string) string {
 }
 
 // permissionDetail 生成权限确认卡片上展示的操作详情。
-func permissionDetail(name, argsJSON string) string {
+// write_file / edit_file 附带内容级统一 diff（增行 + / 删行 -），供用户审查后再放行；
+// 格式为"摘要首行 + 分隔标记 + diff 正文"，前端按 diffMarker 切分渲染。
+func permissionDetail(rt *reactSession, name, argsJSON string) string {
 	switch name {
 	case "write_file":
 		var a writeArgs
-		if err := json.Unmarshal([]byte(argsJSON), &a); err == nil {
-			return fmt.Sprintf("向 %s 写入完整应用（%d 字符），将覆盖当前产物", a.Path, len(a.Content))
+		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+			break
 		}
+		if rt.html == "" {
+			return fmt.Sprintf("首次写入 %s（%d 字符），产物为完整单文件应用。\n%s\n%s",
+				a.Path, len(a.Content), diffMarker, renderDiff(lineDiff("", a.Content), writeDiffCap))
+		}
+		lines := lineDiff(rt.html, a.Content)
+		adds, dels, _ := diffStats(lines)
+		return fmt.Sprintf("整体重写 %s（%d → %d 字符，+%d/-%d 行），将覆盖当前产物。\n%s\n%s",
+			a.Path, len(rt.html), len(a.Content), adds, dels, diffMarker, renderDiff(lines, writeDiffCap))
 	case "edit_file":
 		var a editArgs
-		if err := json.Unmarshal([]byte(argsJSON), &a); err == nil {
-			return fmt.Sprintf("替换产物片段：%s → %s", truncateText(a.OldString, 60), truncateText(a.NewString, 60))
+		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+			break
 		}
+		// 在产物中定位 old_string，带上前后各 2 行上下文生成定位 diff；找不到时退化为片段级 diff
+		lines := fragmentDiff(rt.html, a.OldString, a.NewString, a.ReplaceAll)
+		adds, dels, _ := diffStats(lines)
+		head := fmt.Sprintf("精准修改 index.html（替换 %d 处，+%d/-%d 行）", 1, adds, dels)
+		if a.ReplaceAll {
+			head = fmt.Sprintf("精准修改 index.html（替换全部匹配，+%d/-%d 行）", adds, dels)
+		}
+		return head + "\n" + diffMarker + "\n" + renderDiff(lines, editDiffCap)
 	}
 	return "Agent 请求调用工具 " + name
+}
+
+// fragmentDiff 生成 edit_file 的上下文 diff：以 old_string 为中心，保留前后各 2 行未改动上下文。
+// old_string 在产物中无匹配或匹配多处且未指定 replace_all 时，退化为 old/new 片段的直接对比。
+func fragmentDiff(html, oldStr, newStr string, replaceAll bool) []diffLine {
+	count := strings.Count(html, oldStr)
+	if count == 0 || (count > 1 && !replaceAll) {
+		return lineDiff(oldStr, newStr)
+	}
+	idx := strings.Index(html, oldStr)
+	before := splitLines(html[:idx])
+	after := splitLines(html[idx+len(oldStr):])
+	inner := lineDiff(oldStr, newStr)
+
+	ctx := 2
+	out := make([]diffLine, 0, len(inner)+2*ctx)
+	for i := len(before) - ctx; i < len(before); i++ {
+		if i >= 0 {
+			out = append(out, diffLine{' ', before[i]})
+		}
+	}
+	out = append(out, inner...)
+	for i := 0; i < ctx && i < len(after); i++ {
+		out = append(out, diffLine{' ', after[i]})
+	}
+	return out
 }
 
 func truncateText(s string, n int) string {

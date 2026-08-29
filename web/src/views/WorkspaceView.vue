@@ -135,9 +135,25 @@ function applyDetail(run, stage, message, level) {
   run.events.push({ stage, message, level, ts: Date.now() })
   autoscroll()
 }
+const DIFF_MARKER = '---- DIFF ----'
+function parseDiffLine(l) {
+  if (l.startsWith('+ ')) return { op: '+', text: l.slice(2) }
+  if (l.startsWith('- ')) return { op: '-', text: l.slice(2) }
+  if (l.startsWith('  ')) return { op: ' ', text: l.slice(2) }
+  return { op: ' ', text: l }
+}
+function parsePermDetail(detail) {
+  const i = detail.indexOf(DIFF_MARKER)
+  if (i === -1) return { head: detail, diffLines: null }
+  const head = detail.slice(0, i).trim()
+  const body = detail.slice(i + DIFF_MARKER.length).replace(/^\n/, '')
+  const diffLines = body ? body.split('\n').map(parseDiffLine) : []
+  return { head, diffLines: diffLines.length ? diffLines : null }
+}
 function applyPermission(run, reqId, tool, detail) {
-  run.pendingPerm = { reqId, tool, detail }
-  run.events.push({ stage: 'act', message: '权限确认请求 [' + tool + ']：' + detail, level: 'warn', ts: Date.now() })
+  const { head, diffLines } = parsePermDetail(detail)
+  run.pendingPerm = { reqId, tool, head, diffLines }
+  run.events.push({ stage: 'act', message: '权限确认请求 [' + tool + ']：' + head, level: 'warn', ts: Date.now() })
   autoscroll()
 }
 async function resolvePerm(run, action) {
@@ -249,8 +265,13 @@ function generateSend(text, alreadyRouted, attachIds = []) {
     const [stage, message, level] = e.data.split('\x1f')
     applyDetail(run, stage, message, level)
   })
+  // permission detail 为多行文本（含 diff），按首个 分隔符切分一次，剩余整体作为 detail
+  const detailSplit = (raw) => {
+    const i = raw.indexOf('\x1f')
+    return i === -1 ? [raw, ''] : [raw.slice(0, i), raw.slice(i + 1)]
+  }
   es.addEventListener('permission', e => {
-    const [reqId, tool, detail] = e.data.split('\x1f')
+    const [reqId, tool, detail] = detailSplit(e.data)
     applyPermission(run, reqId, tool, detail)
   })
   es.addEventListener('done', e => {
@@ -297,11 +318,13 @@ async function refineSend(text, alreadyRouted, attachIds = []) {
       const chunks = buf.split('\n\n')
       buf = chunks.pop()
       for (const chunk of chunks) {
-        const evLine = chunk.split('\n').find(l => l.startsWith('event:'))
-        const dataLine = chunk.split('\n').find(l => l.startsWith('data:'))
-        if (!evLine || !dataLine) continue
+        const lines = chunk.split('\n')
+        const evLine = lines.find(l => l.startsWith('event:'))
+        // SSE 多行 data：全部收集后按 \n 合并（diff 正文含换行）
+        const dataLines = lines.filter(l => l.startsWith('data:')).map(l => (l.startsWith('data: ') ? l.slice(6) : l.slice(5)))
+        const data = dataLines.join('\n')
+        if (!evLine || !dataLines.length) continue
         const ev = evLine.slice(6).trim()
-        const data = dataLine.slice(5).trim()
         if (ev === 'stage') {
           const [stage, message] = data.split('\x1f')
           applyStage(run, stage, message)
@@ -309,7 +332,13 @@ async function refineSend(text, alreadyRouted, attachIds = []) {
           const [stage, message, level] = data.split('\x1f')
           applyDetail(run, stage, message, level)
         } else if (ev === 'permission') {
-          const [reqId, tool, detail] = data.split('\x1f')
+          // diff 多行文本：按首个 分隔符切分一次，剩余整体作为 detail
+          const i = data.indexOf('\x1f')
+          const reqId = i === -1 ? data : data.slice(0, i)
+          const rest = i === -1 ? '' : data.slice(i + 1)
+          const j = rest.indexOf('\x1f')
+          const tool = j === -1 ? rest : rest.slice(0, j)
+          const detail = j === -1 ? '' : rest.slice(j + 1)
           applyPermission(run, reqId, tool, detail)
         } else if (ev === 'done') {
           try {
@@ -531,10 +560,18 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
 
-                <!-- 权限确认卡片 -->
+                <!-- 权限确认卡片（含内容级 diff 审查） -->
                 <div v-if="m.pendingPerm" class="perm-card">
                   <div class="perm-head">🔐 写入确认 · {{ m.pendingPerm.tool }}</div>
-                  <div class="perm-detail">{{ m.pendingPerm.detail }}</div>
+                  <div v-if="m.pendingPerm.head" class="perm-detail">{{ m.pendingPerm.head }}</div>
+                  <div v-if="m.pendingPerm.diffLines" class="perm-diff">
+                    <div
+                      v-for="(l, i) in m.pendingPerm.diffLines"
+                      :key="i"
+                      class="diff-line"
+                      :class="{ add: l.op === '+', del: l.op === '-' }"
+                    ><span class="diff-op">{{ l.op === ' ' ? ' ' : l.op }}</span>{{ l.text }}</div>
+                  </div>
                   <div class="perm-actions">
                     <button class="perm-btn primary" @click="resolvePerm(m, 'allow')">允许本次</button>
                     <button class="perm-btn" @click="resolvePerm(m, 'allow_session')">允许并记住</button>
@@ -811,6 +848,18 @@ onBeforeUnmount(() => {
 }
 .perm-head { font-size: 13px; font-weight: 700; color: #a87707; margin-bottom: 5px; }
 .perm-detail { font-size: 12.5px; color: var(--ink-80); line-height: 1.6; margin-bottom: 10px; font-family: var(--font-mono); word-break: break-all; }
+.perm-diff {
+  margin-bottom: 10px; padding: 8px 0;
+  background: rgba(12, 12, 12, .045); border: 1px solid var(--line-soft);
+  border-radius: var(--r-s); max-height: 260px; overflow-y: auto;
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.55;
+}
+.diff-line { padding: 0 10px; white-space: pre-wrap; word-break: break-all; color: var(--ink-55); }
+.diff-line .diff-op { display: inline-block; width: 14px; font-weight: 700; user-select: none; }
+.diff-line.add { background: rgba(45, 187, 92, .12); color: #17743b; }
+.diff-line.add .diff-op { color: #17743b; }
+.diff-line.del { background: rgba(201, 68, 74, .1); color: var(--red); text-decoration: line-through; text-decoration-color: rgba(201, 68, 74, .45); }
+.diff-line.del .diff-op { color: var(--red); }
 .perm-actions { display: flex; gap: 8px; }
 .perm-btn {
   border: 1px solid var(--line); border-radius: var(--r-full);

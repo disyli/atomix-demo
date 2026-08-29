@@ -24,7 +24,7 @@ func defaultPerms() map[string]ToolPerm {
 	return map[string]ToolPerm{
 		"plan_app":    PermAllow,
 		"write_file":  PermAsk,
-		"edit_file":   PermAllow,
+		"edit_file":   PermAsk,
 		"read_file":   PermAllow,
 		"run_checks":  PermAllow,
 		"commit_plan": PermAllow,

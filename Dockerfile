@@ -13,6 +13,8 @@ WORKDIR /src
 COPY server/go.mod server/go.sum ./
 RUN go mod download
 COPY server/ ./
+RUN go vet ./...
+RUN go test ./internal/agent/ -count=1
 RUN CGO_ENABLED=1 go build -o /atomix .
 
 FROM alpine:3.20
