@@ -407,8 +407,7 @@ const composerPlaceholder = computed(() =>
 
 /* ---------- 附件与模式 ---------- */
 function pickFiles() { fileInput.value?.click() }
-async function onFiles(e) {
-  const files = [...e.target.files || []]
+async function uploadFiles(files) {
   for (const f of files) {
     const fd = new FormData()
     fd.append('file', f)
@@ -422,7 +421,16 @@ async function onFiles(e) {
       if (resp.ok) pendingAttachments.value.push(meta)
     } catch {}
   }
+}
+async function onFiles(e) {
+  await uploadFiles([...e.target.files || []])
   e.target.value = ''
+}
+function onPaste(e) {
+  const files = [...e.clipboardData?.files || []]
+  if (!files.length) return
+  e.preventDefault()
+  uploadFiles(files)
 }
 function removeAttachment(idx) { pendingAttachments.value.splice(idx, 1) }
 function onDocClick(e) {
@@ -563,6 +571,7 @@ onBeforeUnmount(() => {
               @keydown.enter.exact.prevent="send"
               @keydown.ctrl.enter.prevent="send"
               @keydown.meta.enter.prevent="send"
+              @paste="onPaste"
             ></textarea>
             <div class="composer-tools">
               <button class="tool-btn" @click="pickFiles" title="上传附件（图片走多模态识图，文本注入上下文）">📎 附件</button>
