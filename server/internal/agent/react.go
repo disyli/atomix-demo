@@ -19,14 +19,16 @@ const (
 
 // reactSession 一次 ReAct 任务会话：持有状态、推送事件、驱动 think→act→observe 循环。
 type reactSession struct {
-	a          *Agent
-	ctx        context.Context
-	brief      string
-	html       string
-	plan       PlanResult
-	summary    string
-	refineNote string // 非空表示迭代修改模式，值为修改指令
-	ev         PipelineEvents
+	a           *Agent
+	ctx         context.Context
+	brief       string
+	html        string
+	plan        PlanResult
+	summary     string
+	refineNote  string   // 非空表示迭代修改模式，值为修改指令
+	mode        string   // build | plan | research
+	attachIDs   []uint   // 本次任务携带的附件 ID
+	ev          PipelineEvents
 }
 
 func (rt *reactSession) stage(stage, msg string) {
@@ -42,7 +44,8 @@ func (rt *reactSession) detail(stage, msg, level string) {
 }
 
 // reactPrompt 构建 ReAct 系统提示词。refineTo 非空表示迭代修改模式。
-func reactPrompt(brief, refineTo string) string {
+// mode：build 标准构建；plan 先出详细规划与交互说明再实施；research 先围绕需求做要点拆解再实施。
+func reactPrompt(brief, refineTo, mode string) string {
 	var sb strings.Builder
 	sb.WriteString(`你是 Atomix 平台的构建 Agent，通过「思考 → 调用工具 → 观察结果」的循环完成应用构建。
 
@@ -61,6 +64,16 @@ func reactPrompt(brief, refineTo string) string {
 5. run_checks 返回 issues 时必须修复并重新 write_file，直到校验通过才能 finish
 6. 每轮先用一两句话正文说明本轮思路（为什么这么做、下一步做什么），再发起工具调用；正文不要为空
 7. 不要空转：同一工具不要连续重复调用，除非按规则修复后重写`)
+	switch mode {
+	case "plan":
+		sb.WriteString(`
+
+本次为【规划模式】：plan_app 的 steps 需给出 4-6 条更细的构建步骤；写入产物前在正文里先给出应用的布局说明与关键交互清单（面向用户可读），再实施。`)
+	case "research":
+		sb.WriteString(`
+
+本次为【深度研究模式】：先用正文输出对该需求的要点拆解（目标用户、核心功能 3-5 条、信息结构、可能的边界情况），再进入规划与实施；write_file 的产物需体现拆解结论。`)
+	}
 	if refineTo != "" {
 		sb.WriteString("\n\n本次任务是在已有应用上做迭代修改。当前产物会通过 read_file 提供，按要求最小化修改后重新 write_file 完整文档。")
 	} else {
@@ -81,10 +94,34 @@ func (rt *reactSession) reactLoop(ctx context.Context) error {
 // liveRun 真实 LLM 的 ReAct 循环。
 func (rt *reactSession) liveRun(ctx context.Context) error {
 	messages := []llm.ChatMessage{
-		{Role: "system", Content: reactPrompt(rt.brief, rt.refineTo())},
+		{Role: "system", Content: reactPrompt(rt.brief, rt.refineTo(), rt.mode)},
 	}
 	if rt.refineTo() != "" {
 		messages = append(messages, llm.ChatMessage{Role: "user", Content: rt.brief})
+	}
+	// 附件上下文：文本附件并入用户消息；图片以多模态 parts 发给 vision 模型
+	if atts := loadAttachments(rt.a, rt.attachIDs); len(atts) > 0 {
+		var parts []llm.ContentPart
+		var textNotes []string
+		for _, at := range atts {
+			if at.DataURL != "" {
+				parts = append(parts, llm.ContentPart{Type: "text", Text: "【附件图片 " + at.Name + "，请在构建时参考其内容】"})
+				p := llm.ContentPart{Type: "image_url"}
+				p.ImageURL = &struct {
+					URL string `json:"url"`
+				}{URL: at.DataURL}
+				parts = append(parts, p)
+			} else if at.Content != "" {
+				textNotes = append(textNotes, "【附件 "+at.Name+"】\n"+at.Content)
+			}
+		}
+		if len(parts) > 0 {
+			messages = append(messages, llm.ChatMessage{Role: "user", ContentParts: parts})
+		}
+		if len(textNotes) > 0 {
+			messages = append(messages, llm.ChatMessage{Role: "user", Content: strings.Join(textNotes, "\n\n")})
+		}
+		rt.detail("build", fmt.Sprintf("已注入 %d 个附件作为构建上下文", len(atts)), "info")
 	}
 
 	tools := toolDefs()
@@ -279,18 +316,19 @@ func mustJSON(v interface{}) string {
 // ---------- 对外入口：与旧流水线 API 兼容 ----------
 
 // Run 执行完整构建任务：先落库项目行（生成中状态可见），再跑 ReAct 循环，完成后回填产物。
-func (a *Agent) Run(ctx context.Context, userID uint, brief string, ev PipelineEvents) (*store.Project, error) {
-	rt := &reactSession{a: a, ctx: ctx, brief: brief, ev: ev}
+// mode: build | plan | research；attachmentIDs: 随任务携带的附件。
+func (a *Agent) Run(ctx context.Context, userID uint, brief, mode string, attachmentIDs []uint, ev PipelineEvents) (*store.Project, error) {
+	rt := &reactSession{a: a, ctx: ctx, brief: brief, mode: mode, attachIDs: attachmentIDs, ev: ev}
 	return rt.runProject(ctx, userID, brief, "")
 }
 
 // Refine 在已有项目上执行迭代修改：读取旧产物 → ReAct 循环修改 → 回填。
-func (a *Agent) Refine(ctx context.Context, userID, projectID uint, instruction string, ev PipelineEvents) (*store.Project, error) {
+func (a *Agent) Refine(ctx context.Context, userID, projectID uint, instruction string, attachmentIDs []uint, ev PipelineEvents) (*store.Project, error) {
 	var p store.Project
 	if err := store.DB.Where("id = ? AND user_id = ?", projectID, userID).First(&p).Error; err != nil {
 		return nil, fmt.Errorf("项目不存在")
 	}
-	rt := &reactSession{a: a, ctx: ctx, brief: instruction, html: p.HTML, ev: ev}
+	rt := &reactSession{a: a, ctx: ctx, brief: instruction, html: p.HTML, attachIDs: attachmentIDs, ev: ev}
 	rt.refineNote = instruction
 	return rt.runProject(ctx, userID, instruction, p.Name)
 }

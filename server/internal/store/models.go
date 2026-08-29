@@ -40,5 +40,19 @@ type Event struct {
 
 func (Event) TableName() string { return "events" }
 
+// Attachment 用户上传的附件（图片走多模态识图，文本/代码直接注入上下文）。
+type Attachment struct {
+	ID         uint   `gorm:"primaryKey" json:"id"`
+	UserID     uint   `gorm:"index" json:"userId"`
+	Name       string `gorm:"size:255" json:"name"`
+	MimeType   string `gorm:"size:100" json:"mimeType"`
+	Size       int64  `json:"size"`
+	Content    string `gorm:"type:text" json:"-"` // 文本类内容原文
+	DataURL    string `gorm:"type:text" json:"-"` // 图片 dataURL（vision 模型用）
+	CreatedAtMs int64 `json:"createdAt"`
+}
+
+func (Attachment) TableName() string { return "attachments" }
+
 // DB 持有全局 gorm 实例。
 var DB *gorm.DB

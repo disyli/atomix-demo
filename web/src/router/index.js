@@ -1,8 +1,13 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
 const routes = [
-  { path: '/', redirect: '/workspace' },
+  { path: '/', redirect: '/dashboard' },
   { path: '/login', component: () => import('../views/LoginView.vue') },
+  {
+    path: '/dashboard',
+    component: () => import('../views/DashboardView.vue'),
+    meta: { auth: true }
+  },
   {
     path: '/workspace',
     component: () => import('../views/WorkspaceView.vue'),
@@ -18,7 +23,7 @@ const router = createRouter({
 router.beforeEach((to) => {
   const token = localStorage.getItem('atomix_token')
   if (to.meta.auth && !token) return '/login'
-  if (to.path === '/login' && token) return '/workspace'
+    if (to.path === '/login' && token) return '/dashboard'
   return true
 })
 

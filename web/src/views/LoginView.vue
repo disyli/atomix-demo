@@ -22,7 +22,7 @@ async function submit() {
     const data = await fn(email.value.trim(), password.value)
     localStorage.setItem('atomix_token', data.token)
     localStorage.setItem('atomix_user', JSON.stringify(data.user))
-    router.push('/workspace')
+    router.push('/dashboard')
   } catch (e) {
     error.value = e.message
   } finally {

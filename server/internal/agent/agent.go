@@ -11,8 +11,9 @@ import (
 
 // Agent 负责编排一次应用生成任务。
 type Agent struct {
-	LLM     llm.Service
-	UseMock bool
+	LLM           llm.Service
+	UseMock       bool
+	CurrentUserID uint // 最近一次请求的用户 ID，用于附件归属校验
 }
 
 // PipelineEvents 流水线事件回调。

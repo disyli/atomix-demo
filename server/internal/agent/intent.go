@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"atomix-demo/server/internal/llm"
+	"atomix-demo/server/internal/store"
 )
 
 // IntentResult 意图识别结果。
@@ -38,16 +39,34 @@ func refineIntent(text string, r IntentResult) IntentResult {
 }
 
 // ClassifyIntent 识别用户消息意图，只做分类与回复，不触发构建流程。
+// attachmentIDs 非空时：图片附件以多模态形式发给 vision 模型，文本附件内容并入消息。
 // 演示模式（UseMock）或 LLM 失败时退化为关键词启发式。
-func (a *Agent) ClassifyIntent(ctx context.Context, text string) IntentResult {
+func (a *Agent) ClassifyIntent(ctx context.Context, text string, attachmentIDs []uint) IntentResult {
 	text = strings.TrimSpace(text)
-	if text == "" {
+	if text == "" && len(attachmentIDs) == 0 {
 		return IntentResult{Intent: "chat", Reply: "请告诉我你想聊点什么，或者想构建一个什么样的应用。"}
 	}
-	if a.UseMock {
-		return heuristicClassify(text)
+	atts := loadAttachments(a, attachmentIDs)
+	hasImage := false
+	var textParts []string
+	for _, at := range atts {
+		if at.DataURL != "" {
+			hasImage = true
+		} else if at.Content != "" {
+			textParts = append(textParts, "【附件 "+at.Name+"】\n"+at.Content)
+		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	if hasImage && text == "" {
+		text = "（用户上传了一张图片，请根据图片内容判断意图）"
+	}
+	fullText := text
+	if len(textParts) > 0 {
+		fullText = text + "\n\n" + strings.Join(textParts, "\n\n")
+	}
+	if a.UseMock {
+		return heuristicClassify(fullText)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	prompt := fmt.Sprintf(`你是 Atomix 平台的对话入口 Agent。Atomix 是一个"通过对话生成网页小应用"的 AI 构建平台，用户输入一句话需求后，平台会自动完成规划、编码、自检并交付一个单文件网页应用。
 请判断用户最新一条消息的意图，只输出一个 JSON 对象（不要 markdown 代码块），格式：
@@ -67,11 +86,26 @@ func (a *Agent) ClassifyIntent(ctx context.Context, text string) IntentResult {
 - "做个记账本" → {"intent":"build","brief":"做一个记账本应用，可记录收支条目并查看汇总"}
 - "做一个番茄钟计时器，25分钟工作加5分钟休息" → {"intent":"build","brief":"做一个番茄钟计时器，25分钟工作加5分钟休息"}
 
-用户消息："""%s"""`, text)
-	resp, err := a.LLM.ChatJSON(ctx, []llm.ChatMessage{
+用户消息："""%s"""`, fullText)
+	msgs := []llm.ChatMessage{
 		{Role: "system", Content: "你是 Atomix 平台的意图识别 Agent，只输出 JSON。"},
-		{Role: "user", Content: prompt},
-	})
+	}
+	um := llm.ChatMessage{Role: "user", Content: prompt}
+	if hasImage {
+		um.Content = ""
+		um.ContentParts = []llm.ContentPart{{Type: "text", Text: prompt}}
+		for _, at := range atts {
+			if at.DataURL != "" {
+				part := llm.ContentPart{Type: "image_url"}
+				part.ImageURL = &struct {
+					URL string `json:"url"`
+				}{URL: at.DataURL}
+				um.ContentParts = append(um.ContentParts, part)
+			}
+		}
+	}
+	msgs = append(msgs, um)
+	resp, err := a.LLM.ChatJSON(ctx, msgs)
 	if err != nil {
 		return heuristicClassify(text)
 	}
@@ -87,13 +121,23 @@ func (a *Agent) ClassifyIntent(ctx context.Context, text string) IntentResult {
 		return refineIntent(text, IntentResult{Intent: r.Intent, Reply: strings.TrimSpace(r.Reply)})
 	case "build":
 		brief := strings.TrimSpace(r.Brief)
-		if brief == "" {
-			brief = text
+		if brief == "" || brief == text {
+			brief = fullText
 		}
 		return IntentResult{Intent: "build", Brief: brief}
 	default:
 		return heuristicClassify(text)
 	}
+}
+
+// loadAttachments 按 ID 集合加载属于当前 Agent 用户的附件（无 DB 时返回空）。
+func loadAttachments(a *Agent, ids []uint) []store.Attachment {
+	if len(ids) == 0 {
+		return nil
+	}
+	var out []store.Attachment
+	store.DB.Where("id IN ? AND user_id = ?", ids, a.CurrentUserID).Find(&out)
+	return out
 }
 
 // heuristicClassify 关键词启发式：仅在演示模式或 LLM 调用失败时兜底。

@@ -2,7 +2,10 @@
 package api
 
 import (
+	"encoding/base64"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +45,80 @@ func Register(r *gin.Engine, h *Handlers) {
 	authed.GET("/generate", h.generateSSE)
 	authed.POST("/projects/:id/refine", h.refineSSE)
 	authed.POST("/chat", h.chatIntent)
+	authed.POST("/attachments", h.uploadAttachment)
+	authed.GET("/attachments", h.listAttachments)
+	authed.GET("/attachments/:id", h.getAttachment)
+}
+
+// uploadAttachment 保存用户上传的附件。图片转 dataURL（vision 识图），文本类存原文。
+func (h *Handlers) uploadAttachment(c *gin.Context) {
+	file, err := c.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少文件"})
+		return
+	}
+	if file.Size > 10*1024*1024 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "文件不能超过 10MB"})
+		return
+	}
+	f, err := file.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取失败"})
+		return
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(f)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取失败"})
+		return
+	}
+	mime := file.Header.Get("Content-Type")
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	a := &store.Attachment{
+		UserID: middleware.UID(c), Name: file.Filename, MimeType: mime,
+		Size: file.Size, CreatedAtMs: store.Now(),
+	}
+	if strings.HasPrefix(mime, "image/") {
+		a.DataURL = "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(raw)
+	} else {
+		a.Content = truncateText(string(raw), 100000)
+	}
+	if err := store.DB.Create(a).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"id": a.ID, "name": a.Name, "mimeType": a.MimeType,
+		"size": a.Size, "isImage": a.DataURL != "", "createdAt": a.CreatedAtMs,
+	})
+}
+
+func (h *Handlers) listAttachments(c *gin.Context) {
+	var as []store.Attachment
+	store.DB.Where("user_id = ?", middleware.UID(c)).Order("id DESC").Limit(50).Find(&as)
+	out := make([]gin.H, 0, len(as))
+	for _, a := range as {
+		out = append(out, gin.H{
+			"id": a.ID, "name": a.Name, "mimeType": a.MimeType,
+			"size": a.Size, "isImage": a.DataURL != "", "createdAt": a.CreatedAtMs,
+		})
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// getAttachment 返回单条附件全文（供构建上下文注入，文本类返回原文，图片返回 dataURL）。
+func (h *Handlers) getAttachment(c *gin.Context) {
+	var a store.Attachment
+	if err := store.DB.Where("id = ? AND user_id = ?", c.Param("id"), middleware.UID(c)).First(&a).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "附件不存在"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"id": a.ID, "name": a.Name, "mimeType": a.MimeType, "size": a.Size,
+		"isImage": a.DataURL != "", "content": a.Content, "dataURL": a.DataURL,
+	})
 }
 
 func modeName(useMock bool) string {
@@ -49,6 +126,14 @@ func modeName(useMock bool) string {
 		return "demo"
 	}
 	return "live"
+}
+
+// truncateText 截断过长文本（api 包内使用）。
+func truncateText(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 func cors() gin.HandlerFunc {
@@ -296,16 +381,19 @@ const shimScript = `
 `
 
 // chatIntent 对用户消息做意图识别：chat 闲聊回复 / clarify 澄清 / build 构建。
-// 前端据此决定展示聊天回复还是进入构建流程。
+// 前端据此决定展示聊天回复还是进入构建流程。可携带附件 ID（图片走多模态识图）。
 func (h *Handlers) chatIntent(c *gin.Context) {
 	var req struct {
-		Message string `json:"message"`
+		Message       string `json:"message"`
+		AttachmentIDs []uint `json:"attachmentIds"`
+		Mode          string `json:"mode"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Message) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "消息不能为空"})
 		return
 	}
-	r := h.Agent.ClassifyIntent(c.Request.Context(), req.Message)
+	h.Agent.CurrentUserID = middleware.UID(c)
+	r := h.Agent.ClassifyIntent(c.Request.Context(), req.Message, req.AttachmentIDs)
 	c.JSON(http.StatusOK, gin.H{"intent": r.Intent, "reply": r.Reply, "brief": r.Brief})
 }
 
@@ -316,6 +404,20 @@ func (h *Handlers) generateSSE(c *gin.Context) {
 	if brief == "" {
 		c.String(http.StatusBadRequest, "brief required")
 		return
+	}
+	mode := c.DefaultQuery("mode", "build")
+	if mode != "build" && mode != "plan" && mode != "research" {
+		mode = "build"
+	}
+	var attachIDs []uint
+	for _, s := range strings.Split(c.Query("attachmentIds"), ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			attachIDs = append(attachIDs, uint(n))
+		}
 	}
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -333,7 +435,7 @@ func (h *Handlers) generateSSE(c *gin.Context) {
 		flusher.Flush()
 	}
 
-	project, err := h.Agent.Run(c.Request.Context(), uid, brief, agent.PipelineEvents{
+	project, err := h.Agent.Run(c.Request.Context(), uid, brief, mode, attachIDs, agent.PipelineEvents{
 		OnStage: func(stage, message string) {
 			send("stage", stage+"\x1f"+message)
 		},
@@ -356,7 +458,8 @@ func (h *Handlers) generateSSE(c *gin.Context) {
 func (h *Handlers) refineSSE(c *gin.Context) {
 	uid := middleware.UID(c)
 	var req struct {
-		Instruction string `json:"instruction"`
+		Instruction   string `json:"instruction"`
+		AttachmentIDs []uint `json:"attachmentIds"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || req.Instruction == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "修改指令不能为空"})
@@ -383,7 +486,7 @@ func (h *Handlers) refineSSE(c *gin.Context) {
 		flusher.Flush()
 	}
 
-	updated, err := h.Agent.Refine(c.Request.Context(), uid, p.ID, req.Instruction, agent.PipelineEvents{
+	updated, err := h.Agent.Refine(c.Request.Context(), uid, p.ID, req.Instruction, req.AttachmentIDs, agent.PipelineEvents{
 		OnStage: func(stage, message string) {
 			send("stage", stage+"\x1f"+message)
 		},

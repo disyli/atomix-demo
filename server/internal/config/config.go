@@ -36,7 +36,7 @@ func Load() (*Config, error) {
 		JWTSecret:     getEnv("ATOMIX_JWT_SECRET", "atomix-demo-dev-secret-please-change"),
 		DeepSeekKey:   os.Getenv("DEEPSEEK_API_KEY"),
 		DeepSeekURL:   getEnv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-		DeepSeekModel: getEnv("DEEPSEEK_MODEL", "deepseek-chat"),
+		DeepSeekModel: getEnv("DEEPSEEK_MODEL", "deepseek-v4-flash-vision-exp"),
 	}
 	cfg.UseMock = cfg.DeepSeekKey == ""
 	return cfg, nil

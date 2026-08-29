@@ -21,6 +21,17 @@ const serverMode = ref('')
 const chatBox = ref(null)
 const composer = ref('')
 const running = ref(false)
+const mode = ref('build')
+const pendingAttachments = ref([])
+const fileInput = ref(null)
+const modeOpen = ref(false)
+
+const modes = [
+  { id: 'build', label: '构建' },
+  { id: 'plan', label: '规划' },
+  { id: 'research', label: '深度研究' }
+]
+const modeLabel = computed(() => modes.find(m => m.id === mode.value)?.label || '构建')
 
 const stages = ['plan', 'build', 'run', 'verify', 'done']
 const stageMeta = {
@@ -90,6 +101,23 @@ async function init() {
     serverMode.value = health.mode === 'live' ? 'DeepSeek 已接入' : '演示模式'
   } catch { serverMode.value = '' }
   loadProjects()
+  // 接收首页 Dashboard 传来的待处理任务
+  try {
+    const raw = sessionStorage.getItem('atomix_pending')
+    if (raw) {
+      sessionStorage.removeItem('atomix_pending')
+      const p = JSON.parse(raw)
+      mode.value = p.mode || 'build'
+      pendingAttachments.value = p.attachments || []
+      if (p.chat) {
+        thread.value.push(newUserMsg(p.brief))
+        thread.value.push(reactive({ id: 'r' + (++seq), role: 'assistant', kind: 'chat', text: p.chat, status: 'chat' }))
+        autoscroll()
+      } else if (p.brief) {
+        routeMessageWith(p.brief, p.attachmentIds || [])
+      }
+    }
+  } catch {}
 }
 async function loadProjects() {
   try { projects.value = await api.listProjects() } catch {}
@@ -124,16 +152,7 @@ function failRun(run, text) {
   autoscroll()
 }
 
-/* ---------- 意图路由：chat 闲聊 / clarify 澄清 / build 构建 ---------- */
-async function classify(text) {
-  const resp = await fetch('/api/chat', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (localStorage.getItem('atomix_token') || '') },
-    body: JSON.stringify({ message: text })
-  })
-  if (!resp.ok) throw new Error('意图识别失败 (' + resp.status + ')')
-  return resp.json()
-}
+/* ---------- 发送：新建 or 迭代修改 ---------- */
 
 function send() {
   const text = composer.value.trim()
@@ -143,12 +162,16 @@ function send() {
 }
 
 async function routeMessage(text) {
+  routeMessageWith(text, pendingAttachments.value.map(a => a.id))
+}
+
+async function routeMessageWith(text, attachIds) {
   running.value = true
   thread.value.push(newUserMsg(text))
   scrollToBottom()
   let r
   try {
-    r = await classify(text)
+    r = await classify(text, attachIds, mode.value)
   } catch (e) {
     running.value = false
     thread.value.push(reactive({
@@ -169,18 +192,32 @@ async function routeMessage(text) {
     return
   }
   const brief = r.brief || text
-  if (activeProject.value) refineSend(brief, true)
-  else generateSend(brief, true)
+  const ids = attachIds || []
+  if (activeProject.value) refineSend(brief, true, ids)
+  else generateSend(brief, true, ids)
 }
 
-function generateSend(text, alreadyRouted) {
+async function classify(text, attachIds = [], m = 'build') {
+  const resp = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (localStorage.getItem('atomix_token') || '') },
+    body: JSON.stringify({ message: text, attachmentIds: attachIds, mode: m })
+  })
+  if (!resp.ok) throw new Error('意图识别失败 (' + resp.status + ')')
+  return resp.json()
+}
+
+function generateSend(text, alreadyRouted, attachIds = []) {
   if (!alreadyRouted) { running.value = true; thread.value.push(newUserMsg(text)) }
   const run = reactive(newRunMsg(text))
   thread.value.push(run)
   scrollToBottom()
 
-  const es = new EventSource('/api/generate?brief=' + encodeURIComponent(text) +
-    '&t=' + encodeURIComponent(localStorage.getItem('atomix_token') || ''))
+  const params = new URLSearchParams({
+    brief: text, mode: mode.value,
+    attachmentIds: attachIds.join(','), t: localStorage.getItem('atomix_token') || ''
+  })
+  const es = new EventSource('/api/generate?' + params.toString())
   es.addEventListener('stage', e => {
     const [stage, message] = e.data.split('\x1f')
     applyStage(run, stage, message)
@@ -210,7 +247,7 @@ function generateSend(text, alreadyRouted) {
   })
 }
 
-async function refineSend(text, alreadyRouted) {
+async function refineSend(text, alreadyRouted, attachIds = []) {
   if (!alreadyRouted) { running.value = true; thread.value.push(newUserMsg(text)) }
   const pid = activeProject.value.id
   const run = reactive(newRunMsg(text))
@@ -220,7 +257,7 @@ async function refineSend(text, alreadyRouted) {
     const resp = await fetch('/api/projects/' + pid + '/refine', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (localStorage.getItem('atomix_token') || '') },
-      body: JSON.stringify({ instruction: text })
+      body: JSON.stringify({ instruction: text, attachmentIds: attachIds })
     })
     if (!resp.ok || !resp.body) throw new Error('修改请求失败 (' + resp.status + ')')
     const reader = resp.body.getReader()
@@ -338,8 +375,37 @@ const composerPlaceholder = computed(() =>
     : '描述你想生成的应用，例如：做一个番茄钟计时器…'
 )
 
-onMounted(() => window.addEventListener('message', onShimMessage))
-onBeforeUnmount(() => window.removeEventListener('message', onShimMessage))
+/* ---------- 附件与模式 ---------- */
+function pickFiles() { fileInput.value?.click() }
+async function onFiles(e) {
+  const files = [...e.target.files || []]
+  for (const f of files) {
+    const fd = new FormData()
+    fd.append('file', f)
+    try {
+      const resp = await fetch('/api/attachments', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + (localStorage.getItem('atomix_token') || '') },
+        body: fd
+      })
+      const meta = await resp.json()
+      if (resp.ok) pendingAttachments.value.push(meta)
+    } catch {}
+  }
+  e.target.value = ''
+}
+function removeAttachment(idx) { pendingAttachments.value.splice(idx, 1) }
+function onDocClick(e) {
+  if (modeOpen.value && !e.target.closest('.mode-wrap')) modeOpen.value = false
+}
+onMounted(() => {
+  window.addEventListener('message', onShimMessage)
+  document.addEventListener('click', onDocClick)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('message', onShimMessage)
+  document.removeEventListener('click', onDocClick)
+})
 </script>
 
 <template>
@@ -434,12 +500,20 @@ onBeforeUnmount(() => window.removeEventListener('message', onShimMessage))
                 </div>
                 <div v-if="m.status === 'failed'" class="run-error">{{ m.errorText }}</div>
               </div>
-            </div>
-          </template>
+    <input ref="fileInput" type="file" multiple hidden @change="onFiles" accept="image/*,.txt,.md,.json,.csv,.js,.html,.css" />
+  </div>
+</template>
         </div>
 
         <!-- 底部输入区（固定） -->
         <footer class="composer">
+          <div v-if="pendingAttachments.length" class="atts-row">
+            <span v-for="(a, i) in pendingAttachments" :key="a.id" class="att">
+              <span class="att-ico">{{ a.isImage ? '🖼' : '📄' }}</span>
+              <span class="att-name">{{ a.name }}</span>
+              <button class="att-x" @click="removeAttachment(i)">×</button>
+            </span>
+          </div>
           <div class="composer-box">
             <textarea
               v-model="composer"
@@ -450,10 +524,30 @@ onBeforeUnmount(() => window.removeEventListener('message', onShimMessage))
               @keydown.ctrl.enter.prevent="send"
               @keydown.meta.enter.prevent="send"
             ></textarea>
-            <button class="go" :disabled="running || !composer.trim()" @click="send" :title="running ? '构建中…' : '发送'">
-              <svg v-if="!running" viewBox="0 0 16 16" width="15" height="15" fill="none"><path d="M2 8h10M8.5 3.5 13 8l-4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              <span v-else class="spin">◐</span>
-            </button>
+            <div class="composer-tools">
+              <button class="tool-btn" @click="pickFiles" title="上传附件（图片走多模态识图，文本注入上下文）">📎 附件</button>
+              <span class="flex1"></span>
+              <div class="mode-wrap">
+                <button class="tool-btn mode" @click.stop="modeOpen = !modeOpen">
+                  {{ modeLabel }} <span class="chev">⌄</span>
+                </button>
+                <div v-if="modeOpen" class="mode-menu">
+                  <button
+                    v-for="m in modes" :key="m.id"
+                    class="mode-item" :class="{ active: mode === m.id }"
+                    @click="mode = m.id; modeOpen = false"
+                  >
+                    {{ m.label }}
+                    <span v-if="m.id === 'plan'" class="mode-desc">先出规划再实施</span>
+                    <span v-else-if="m.id === 'research'" class="mode-desc">先拆解需求再构建</span>
+                  </button>
+                </div>
+              </div>
+              <button class="go" :disabled="running || !composer.trim()" @click="send" :title="running ? '构建中…' : '发送'">
+                <svg v-if="!running" viewBox="0 0 16 16" width="15" height="15" fill="none"><path d="M2 8h10M8.5 3.5 13 8l-4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                <span v-else class="spin">◐</span>
+              </button>
+            </div>
           </div>
           <div class="composer-hint">
             <span>Enter 发送 · Shift+Enter 换行</span>
@@ -516,6 +610,7 @@ onBeforeUnmount(() => window.removeEventListener('message', onShimMessage))
         </div>
       </section>
     </div>
+    <input ref="fileInput" type="file" multiple hidden @change="onFiles" accept="image/*,.txt,.md,.json,.csv,.js,.html,.css" />
   </div>
 </template>
 
@@ -671,28 +766,56 @@ onBeforeUnmount(() => window.removeEventListener('message', onShimMessage))
 
 /* ============ 底部输入区 ============ */
 .composer { flex-shrink: 0; padding: 10px 22px 16px; }
+.atts-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.att { display: inline-flex; align-items: center; gap: 6px; background: var(--beige-50); border: 1px solid var(--line-soft); border-radius: var(--r-full); padding: 5px 12px; font-size: 12px; }
+.att-ico { font-size: 13px; }
+.att-name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-80); }
+.att-x { color: var(--ink-30); font-size: 13px; }
 .composer-box {
-  display: flex; align-items: flex-end; gap: 10px;
+  display: flex; flex-direction: column;
   background: var(--beige-50); border: 1px solid var(--line);
-  border-radius: var(--r-l); padding: 10px 10px 10px 16px;
+  border-radius: 18px; padding: 12px 12px 8px 16px;
   box-shadow: 0 2px 12px rgba(12,12,12,.06);
   transition: border-color .18s ease, box-shadow .18s ease;
 }
 .composer-box:focus-within { border-color: var(--blue-500); box-shadow: 0 2px 16px rgba(66,103,255,.14); }
 .composer-box textarea {
-  flex: 1; border: none; outline: none; background: transparent; resize: none;
+  border: none; outline: none; background: transparent; resize: none;
   color: var(--ink-100); font-size: 14px; line-height: 1.6;
-  max-height: 120px; padding: 4px 0;
+  max-height: 120px; padding: 0; width: 100%;
 }
+.composer-tools { display: flex; align-items: center; gap: 6px; padding: 6px 0 2px; }
+.flex1 { flex: 1; }
+.tool-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  border: 1px solid var(--line); border-radius: var(--r-full);
+  background: transparent; padding: 5px 12px; font-size: 12px; font-weight: 600; color: var(--ink-55);
+  transition: all .18s ease;
+}
+.tool-btn:hover { color: var(--ink-100); border-color: var(--ink-30); background: var(--beige-100); }
+.mode-wrap { position: relative; }
+.mode-menu {
+  position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 30;
+  width: 200px; background: var(--beige-50); border: 1px solid var(--line-soft);
+  border-radius: 12px; box-shadow: 0 10px 36px rgba(12,12,12,.14); padding: 5px;
+  display: flex; flex-direction: column; gap: 1px;
+}
+.mode-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 9px 11px; border-radius: 8px; font-size: 13px; font-weight: 550; text-align: left;
+}
+.mode-item:hover { background: var(--beige-100); }
+.mode-item.active { background: var(--blue-50); color: var(--blue-600); font-weight: 650; }
+.mode-desc { font-size: 11px; color: var(--ink-30); font-weight: 400; }
 .composer-box textarea::placeholder { color: var(--ink-30); }
 .composer-box textarea:disabled { opacity: .6; }
 .go {
-  width: 38px; height: 38px; border-radius: 12px; flex-shrink: 0;
-  background: var(--blue-500); color: #fff;
+  width: 36px; height: 36px; border-radius: 12px; flex-shrink: 0;
+  background: var(--orange); color: #fff;
   display: flex; align-items: center; justify-content: center;
   transition: background .18s ease, transform .12s ease;
 }
-.go:hover:not(:disabled) { background: var(--blue-600); }
+.go:hover:not(:disabled) { background: #e09e12; }
 .go:active:not(:disabled) { transform: scale(.95); }
 .go:disabled { background: var(--beige-300); color: var(--beige-50); cursor: default; }
 .spin { display: inline-block; animation: rot 1s linear infinite; font-size: 16px; }

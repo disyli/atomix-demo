@@ -17,7 +17,7 @@ func Open(dataDir string) error {
 	if err != nil {
 		return err
 	}
-	if err := db.AutoMigrate(&User{}, &Project{}, &Event{}); err != nil {
+	if err := db.AutoMigrate(&User{}, &Project{}, &Event{}, &Attachment{}); err != nil {
 		return err
 	}
 	DB = db
