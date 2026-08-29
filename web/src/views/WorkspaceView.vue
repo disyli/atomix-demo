@@ -275,10 +275,11 @@ function generateSend(text, alreadyRouted, attachIds = []) {
     return [first, j === -1 ? rest : rest.slice(0, j), j === -1 ? '' : rest.slice(j + 1)]
   }
   // 后端单行 base64 载荷（多行 diff 经编码规避 SSE 多行 data 与分隔符歧义）；旧格式三段明文兼容
+  const b64ToUtf8 = (s) => new TextDecoder().decode(Uint8Array.from(atob(s), c => c.charCodeAt(0)))
   const decodePermPayload = (raw) => {
     const [reqId, tool, detail] = detailSplit(raw)
     if (detail.startsWith('b64:')) {
-      try { return [reqId, tool, atob(detail.slice(4))] } catch { return [reqId, tool, ''] }
+      try { return [reqId, tool, b64ToUtf8(detail.slice(4))] } catch { return [reqId, tool, ''] }
     }
     return [reqId, tool, detail]
   }
@@ -384,7 +385,10 @@ async function refineSend(text, alreadyRouted, attachIds = []) {
           const tool = j === -1 ? rest : rest.slice(0, j)
           let detail = j === -1 ? '' : rest.slice(j + 1)
           if (detail.startsWith('b64:')) {
-            try { detail = decodeURIComponent(escape(atob(detail.slice(4)))) } catch { detail = '' }
+            try {
+              const bin = atob(detail.slice(4))
+              detail = new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0)))
+            } catch { detail = '' }
           }
           applyPermission(run, reqId, tool, detail)
         } else if (ev === 'done') {
