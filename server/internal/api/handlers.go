@@ -41,6 +41,7 @@ func Register(r *gin.Engine, h *Handlers) {
 	authed.GET("/projects/:id/preview", h.previewHTML)
 	authed.GET("/generate", h.generateSSE)
 	authed.POST("/projects/:id/refine", h.refineSSE)
+	authed.POST("/chat", h.chatIntent)
 }
 
 func modeName(useMock bool) string {
@@ -293,6 +294,20 @@ const shimScript = `
 })();
 </script>
 `
+
+// chatIntent 对用户消息做意图识别：chat 闲聊回复 / clarify 澄清 / build 构建。
+// 前端据此决定展示聊天回复还是进入构建流程。
+func (h *Handlers) chatIntent(c *gin.Context) {
+	var req struct {
+		Message string `json:"message"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Message) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "消息不能为空"})
+		return
+	}
+	r := h.Agent.ClassifyIntent(c.Request.Context(), req.Message)
+	c.JSON(http.StatusOK, gin.H{"intent": r.Intent, "reply": r.Reply, "brief": r.Brief})
+}
 
 // generateSSE 以 SSE 流式推送一次完整生成流水线的进度。
 func (h *Handlers) generateSSE(c *gin.Context) {

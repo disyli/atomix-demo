@@ -124,18 +124,57 @@ function failRun(run, text) {
   autoscroll()
 }
 
-/* ---------- 发送：新建 or 迭代修改 ---------- */
+/* ---------- 意图路由：chat 闲聊 / clarify 澄清 / build 构建 ---------- */
+async function classify(text) {
+  const resp = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (localStorage.getItem('atomix_token') || '') },
+    body: JSON.stringify({ message: text })
+  })
+  if (!resp.ok) throw new Error('意图识别失败 (' + resp.status + ')')
+  return resp.json()
+}
+
 function send() {
   const text = composer.value.trim()
   if (!text || running.value) return
   composer.value = ''
-  if (activeProject.value) refineSend(text)
-  else generateSend(text)
+  routeMessage(text)
 }
 
-function generateSend(text) {
+async function routeMessage(text) {
   running.value = true
   thread.value.push(newUserMsg(text))
+  scrollToBottom()
+  let r
+  try {
+    r = await classify(text)
+  } catch (e) {
+    running.value = false
+    thread.value.push(reactive({
+      id: 'r' + (++seq), role: 'assistant', brief: '', status: 'failed',
+      errorText: e.message || '网络错误，请重试', events: [], stageState: {},
+      projectId: null, projectName: '', summary: ''
+    }))
+    autoscroll()
+    return
+  }
+  if (r.intent === 'chat' || r.intent === 'clarify') {
+    thread.value.push(reactive({
+      id: 'r' + (++seq), role: 'assistant', kind: 'chat', text: r.reply || '我在的，请继续说～',
+      status: 'chat'
+    }))
+    running.value = false
+    autoscroll()
+    return
+  }
+  const brief = r.brief || text
+  if (activeProject.value) refineSend(brief, true)
+  else generateSend(brief, true)
+}
+
+function generateSend(text, alreadyRouted) {
+  if (!alreadyRouted) { running.value = true; thread.value.push(newUserMsg(text)) }
   const run = reactive(newRunMsg(text))
   thread.value.push(run)
   scrollToBottom()
@@ -171,10 +210,9 @@ function generateSend(text) {
   })
 }
 
-async function refineSend(text) {
-  running.value = true
+async function refineSend(text, alreadyRouted) {
+  if (!alreadyRouted) { running.value = true; thread.value.push(newUserMsg(text)) }
   const pid = activeProject.value.id
-  thread.value.push(newUserMsg(text))
   const run = reactive(newRunMsg(text))
   thread.value.push(run)
   scrollToBottom()
@@ -340,6 +378,12 @@ onBeforeUnmount(() => window.removeEventListener('message', onShimMessage))
             <div v-if="m.role === 'user'" class="msg user">
               <div class="bubble">{{ m.text }}</div>
               <div class="ava u">{{ (user.email || '?')[0].toUpperCase() }}</div>
+            </div>
+
+            <!-- 助手消息（聊天回复） -->
+            <div v-else-if="m.kind === 'chat'" class="msg assistant">
+              <div class="ava">A</div>
+              <div class="bubble chat-bubble">{{ m.text }}</div>
             </div>
 
             <!-- 助手消息（构建回合） -->
@@ -560,6 +604,7 @@ onBeforeUnmount(() => window.removeEventListener('message', onShimMessage))
   border-bottom-right-radius: 6px; white-space: pre-wrap; word-break: break-word;
 }
 .msg.assistant .bubble { border-bottom-left-radius: 6px; min-width: 0; flex: 1; max-width: none; }
+.chat-bubble { max-width: 100% !important; white-space: pre-wrap; }
 
 /* 助手运行块 */
 .run-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 14px; }
