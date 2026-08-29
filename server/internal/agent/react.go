@@ -169,6 +169,11 @@ func (rt *reactSession) liveRun(ctx context.Context) error {
 // refineTo 是否处于迭代修改模式（非空即修改指令）。
 func (rt *reactSession) refineTo() string { return rt.refineNote }
 
+// act 展示工具行动事件（与 live 模式格式一致）。
+func (rt *reactSession) act(tool, argsJSON string) {
+	rt.detail("act", fmt.Sprintf("调用 %s → %s", tool, toolActionText(tool, argsJSON)), "info")
+}
+
 // demoRun 演示模式的脚本化 ReAct 轨迹：与真实循环同构（plan → write → checks(失败) → 修复重写 → checks(通过) → finish），
 // 工具全部真实执行，让评审者无 Key 也能观察到完整的 think→act→observe 闭环。
 func (rt *reactSession) demoRun() error {
@@ -176,41 +181,50 @@ func (rt *reactSession) demoRun() error {
 
 	rt.detail("think", "分析需求关键词，匹配内置模板能力清单，确定应用形态与构建步骤", "info")
 	tid := Match(rt.brief)
-	planRes := rt.runTool("plan_app", mustJSON(planArgs{
+	planArgsJSON := mustJSON(planArgs{
 		AppName:  DefaultName(tid),
 		Template: tid,
 		Reason:   "演示模式：按关键词规则匹配最贴合的内置模板",
 		Steps:    []string{"搭建布局骨架", "实现数据模型与持久化", "绑定交互事件", "自检产物"},
-	}))
+	})
+	rt.act("plan_app", planArgsJSON)
+	planRes := rt.runTool("plan_app", planArgsJSON)
 	rt.observe("plan_app", planRes)
 
 	rt.detail("think", "按计划生成完整单文件应用：布局 + 数据层 + 交互层 + 持久化", "info")
 	_, html, _ := RenderTemplate(tid, DefaultName(tid))
 	// 演示自修复：首版注入一个会被真实校验器抓住的问题（document.cookie）
 	broken := strings.Replace(html, "<head>", "<head>\n<script>document.cookie='demo=1';</script>", 1)
-	writeRes := rt.runTool("write_file", mustJSON(writeArgs{Path: "index.html", Content: broken}))
+	writeArgsJSON := mustJSON(writeArgs{Path: "index.html", Content: broken})
+	rt.act("write_file", writeArgsJSON)
+	writeRes := rt.runTool("write_file", writeArgsJSON)
 	rt.observe("write_file", writeRes)
 
 	rt.detail("think", "产物已写入，执行静态校验确认文档结构、沙箱兼容性与交互完整性", "info")
+	rt.act("run_checks", "{}")
 	checkRes := rt.runTool("run_checks", "{}")
 	rt.observe("run_checks", checkRes)
 
 	if !checkRes.OK {
 		rt.detail("think", "校验发现沙箱兼容性问题：document.cookie 在 opaque origin 下抛 SecurityError。定位后移除该调用，重新写入", "warn")
-		fixed := rt.html
 		// 真实修复：移除注入的问题代码
-		fixed = strings.Replace(fixed, "<script>document.cookie='demo=1';</script>\n", "", 1)
+		fixed := strings.Replace(rt.html, "<script>document.cookie='demo=1';</script>\n", "", 1)
 		fixed = strings.Replace(fixed, "<script>document.cookie='demo=1';</script>", "", 1)
-		rewriteRes := rt.runTool("write_file", mustJSON(writeArgs{Path: "index.html", Content: fixed}))
+		rewriteJSON := mustJSON(writeArgs{Path: "index.html", Content: fixed})
+		rt.act("write_file", rewriteJSON)
+		rewriteRes := rt.runTool("write_file", rewriteJSON)
 		rt.observe("write_file", rewriteRes)
 
 		rt.detail("think", "修复完成，重新校验全部检查项", "info")
+		rt.act("run_checks", "{}")
 		recheck := rt.runTool("run_checks", "{}")
 		rt.observe("run_checks", recheck)
 	}
 
 	rt.detail("think", "产物已通过全部校验，汇总构建结果", "info")
-	finRes := rt.runTool("finish", mustJSON(finishArgs{Summary: "已完成 " + DefaultName(tid) + " 的构建与自检"}))
+	finishJSON := mustJSON(finishArgs{Summary: "已完成 " + DefaultName(tid) + " 的构建与自检"})
+	rt.act("finish", finishJSON)
+	finRes := rt.runTool("finish", finishJSON)
 	rt.observe("finish", finRes)
 	return nil
 }
