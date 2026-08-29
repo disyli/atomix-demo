@@ -59,7 +59,8 @@ func reactPrompt(brief, refineTo string) string {
 3. 禁止使用 document.cookie（沙箱环境会抛 SecurityError）
 4. 必须包含真实交互（事件绑定、DOM 更新），不能是静态页面
 5. run_checks 返回 issues 时必须修复并重新 write_file，直到校验通过才能 finish
-6. 每轮先想清楚再行动，不要空转`)
+6. 每轮先用一两句话正文说明本轮思路（为什么这么做、下一步做什么），再发起工具调用；正文不要为空
+7. 不要空转：同一工具不要连续重复调用，除非按规则修复后重写`)
 	if refineTo != "" {
 		sb.WriteString("\n\n本次任务是在已有应用上做迭代修改。当前产物会通过 read_file 提供，按要求最小化修改后重新 write_file 完整文档。")
 	} else {
