@@ -41,8 +41,8 @@ func TestLineDiffHugeFallback(t *testing.T) {
 	old := strings.Repeat("o\n", maxDiffDP+10)
 	nw := strings.Repeat("n\n", maxDiffDP+10)
 	got := lineDiff(old, nw)
-	// 降级：全部删 + 全部增
-	if len(got) != 2*(maxDiffDP+10) {
+	// 降级：全部删 + 全部增（Repeat("o\n", n) 按行切分含尾空行，实际 n+1 行）
+	if len(got) != 2*(maxDiffDP+11) {
 		t.Fatalf("降级 diff 行数不符：%d", len(got))
 	}
 	if got[0].Op != '-' || got[len(got)-1].Op != '+' {
