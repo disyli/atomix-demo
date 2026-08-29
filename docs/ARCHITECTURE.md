@@ -26,9 +26,17 @@ flowchart TB
             direction TB
             INTENT["intent.go<br/>闲聊/澄清/构建 意图路由"]
             REACT["react.go<br/>ReAct 循环 think→act→observe（≤12轮）<br/>live 真实循环 / demo 脚本化同构轨迹"]
-            TOOLS["tools.go<br/>plan_app / write_file / read_file<br/>run_checks / finish"]
+            TOOLS["tools.go<br/>plan_app / write_file / edit_file / read_file<br/>run_checks / finish"]
+            PERM["permission.go<br/>权限网关 + 用户确认卡片（HITL）"]
+            BUDGET["compress.go<br/>上下文预算与压缩"]
+            VERIFY["verify.go<br/>静态校验 + 无头浏览器实测"]
+            SUB["subagent.go<br/>研究子 Agent（research 模式）"]
             PLAN["plan.go + templates_html.go<br/>模板匹配与降级渲染<br/>todo / notes / kanban"]
             INTENT --> REACT --> TOOLS
+            REACT --- PERM
+            REACT --- BUDGET
+            REACT -.研究简报.-> SUB
+            TOOLS -.校验.-> VERIFY
             TOOLS -.降级.-> PLAN
         end
 
@@ -82,6 +90,8 @@ sequenceDiagram
     loop ReAct 循环（≤12 轮，校验失败自动修复 ≤3 次）
         AG->>LLM: ChatWithTools（含附件多模态上下文）
         LLM-->>AG: 思考文本 + 工具调用
+        AG->>AG: 权限网关拦截敏感工具 → 推送确认卡片（HITL）
+        U-->>AG: allow / allow_session / reject（HTTP 回填）
         AG->>AG: 执行工具 plan_app → write_file → run_checks → finish
         AG-->>WV: SSE 推送 think / act / observe 事件（同步落库）
         AG-->>LLM: 工具观察结果回喂
@@ -133,15 +143,19 @@ atomix-demo/
 | POST | `/api/chat` | JWT | 意图路由（闲聊/澄清/构建） |
 | POST/GET | `/api/attachments` | JWT | 附件上传 / 列表 |
 | GET | `/api/attachments/:id` | JWT | 附件内容（图片转 dataURL 多模态注入） |
+| POST | `/api/permissions/:reqId` | JWT | 权限确认回填（allow / allow_session / reject） |
 
 ## 关键设计
 
-- **双模式运行**：配置 `DEEPSEEK_API_KEY` 走真实 ReAct function calling 循环；未配置自动降级 demo 模式，脚本化轨迹与真实循环同构（工具全真执行，含一次注入缺陷 → 校验抓取 → 自动修复的完整闭环），全流程可体验。
+- **三模式构建**：`build` 标准构建 / `plan` 两阶段规划先行（工具层门控：plan_app、commit_plan 之外物理不可见，commit_plan 提交后解锁实施工具） / `research` 研究子 Agent 独立上下文拆解需求，简报注入主循环构建。
+- **权限网关（HITL）**：`write_file` / `edit_file` 等 ask 级工具调用前推送确认卡片；用户 allow / allow_session / reject，HTTP 接口按请求 ID 回填注册表解除阻塞，超时或拒绝则把拦截结果回喂模型。
+- **上下文压缩**：消息历史接近预算时自动压缩为状态摘要，保留 system / 需求 / 最近消息，长任务不爆上下文。
+- **自修复闭环**：`run_checks` 静态校验 + 无头浏览器实测运行时异常，失败优先 `edit_file` 片段级精准修复（≤3 次），整体性缺陷才 `write_file` 重写（成功写入 ≤2 次）。
 - **事件双写**：SSE 实时推送的同时落库 `events` 表，历史项目可完整回放 ReAct 轨迹。
 - **项目行先行落库**：构建任务开始前即创建 `status=generating` 的项目行，修复"生成中不可见"问题。
 - **沙箱安全**：产物在 `sandbox` 属性 iframe 中运行；`document.cookie` 在校验层与提示词双重拦截，`localStorage` 不可用时平台自动垫片降级。
 - **多模态附件**：图片附件以 `image_url` parts 注入 vision 模型，文本附件并入用户消息。
-- **防护栏**：ReAct ≤12 轮、自动修复 ≤3 次、单文件产物只允许成功写入一次。
+- **防护栏**：ReAct ≤12 轮（plan 模式 +4）、自动修复 ≤3 次。
 
 ## 部署拓扑
 
