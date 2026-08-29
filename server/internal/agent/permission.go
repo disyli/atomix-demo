@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -98,7 +99,8 @@ func newPermGateway(reg *PermRegistry) *permGateway {
 // authorize 判定一个工具调用能否执行。
 // 返回 (是否放行, 拒绝时回喂给模型的观察文本)。
 // ask 级工具先推送确认卡片（OnPermission）再阻塞等待用户决定；无确认通道的环境降级为放行并留痕。
-func (g *permGateway) authorize(tool, detail string, ev PipelineEvents) (bool, string) {
+// ctx 取消（用户停止任务）时立即返回，不再挂起等待确认。
+func (g *permGateway) authorize(ctx context.Context, tool, detail string, ev PipelineEvents) (bool, string) {
 	g.mu.Lock()
 	if g.granted[tool] {
 		g.mu.Unlock()
@@ -148,6 +150,8 @@ func (g *permGateway) authorize(tool, detail string, ev PipelineEvents) (bool, s
 		default:
 			return false, "用户拒绝了本次 " + tool + " 操作。请调整方案：不要执行该写入，直接向用户说明情况并收尾。"
 		}
+	case <-ctx.Done():
+		return false, ErrCanceled.Error()
 	case <-time.After(permConfirmTimeout):
 		return false, "权限确认等待超时（用户未响应），视为拒绝。请直接说明情况并收尾。"
 	}

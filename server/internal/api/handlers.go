@@ -3,6 +3,7 @@ package api
 
 import (
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -49,6 +50,7 @@ func Register(r *gin.Engine, h *Handlers) {
 	authed.GET("/attachments", h.listAttachments)
 	authed.GET("/attachments/:id", h.getAttachment)
 	authed.POST("/permissions/:reqId", h.resolvePermission)
+	authed.POST("/runs/:runId/cancel", h.cancelRun)
 }
 
 // resolvePermission 用户对权限确认卡片做出决定：allow / allow_session / reject。
@@ -74,6 +76,15 @@ func (h *Handlers) resolvePermission(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// cancelRun 停止按钮：取消一个运行中的构建/迭代任务（校验归属，只能停止自己的任务）。
+func (h *Handlers) cancelRun(c *gin.Context) {
+	if h.Agent.Runs.Cancel(middleware.UID(c), c.Param("runId")) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+		return
+	}
+	c.JSON(http.StatusNotFound, gin.H{"error": "任务不存在或已结束"})
 }
 
 // uploadAttachment 保存用户上传的附件。图片转 dataURL（vision 识图），文本类存原文。
@@ -349,7 +360,10 @@ func (h *Handlers) generateSSE(c *gin.Context) {
 		flusher.Flush()
 	}
 
-	project, err := h.Agent.Run(c.Request.Context(), uid, brief, mode, attachIDs, agent.PipelineEvents{
+	runID, runCtx := h.Agent.Runs.Start(uid)
+	defer h.Agent.Runs.Remove(runID)
+
+	project, err := h.Agent.Run(runCtx, uid, brief, mode, attachIDs, agent.PipelineEvents{
 		OnStage: func(stage, message string) {
 			send("stage", stage+"\x1f"+message)
 		},
@@ -362,6 +376,12 @@ func (h *Handlers) generateSSE(c *gin.Context) {
 			send("permission", reqID+"\x1f"+tool+"\x1fb64:"+base64.StdEncoding.EncodeToString([]byte(detail)))
 		},
 	})
+	if errors.Is(err, agent.ErrCanceled) {
+		// 用户主动停止：发 runId 供前端定位 + stopped 终态事件（非 error）
+		send("runId", runID)
+		send("stopped", "已按用户要求停止构建")
+		return
+	}
 	if err != nil {
 		send("error", "生成失败: "+err.Error())
 		return
@@ -369,7 +389,7 @@ func (h *Handlers) generateSSE(c *gin.Context) {
 	// 重新加载完整事件历史
 	var es []store.Event
 	store.DB.Where("project_id = ?", project.ID).Order("id ASC").Find(&es)
-	payload := gin.H{"project": projectBrief(*project)}
+	payload := gin.H{"project": projectBrief(*project), "runId": runID}
 	c.SSEvent("done", toJSON(payload))
 }
 
@@ -405,7 +425,10 @@ func (h *Handlers) refineSSE(c *gin.Context) {
 		flusher.Flush()
 	}
 
-	updated, err := h.Agent.Refine(c.Request.Context(), uid, p.ID, req.Instruction, req.AttachmentIDs, agent.PipelineEvents{
+	runID, runCtx := h.Agent.Runs.Start(uid)
+	defer h.Agent.Runs.Remove(runID)
+
+	updated, err := h.Agent.Refine(runCtx, uid, p.ID, req.Instruction, req.AttachmentIDs, agent.PipelineEvents{
 		OnStage: func(stage, message string) {
 			send("stage", stage+"\x1f"+message)
 		},
@@ -417,9 +440,14 @@ func (h *Handlers) refineSSE(c *gin.Context) {
 			send("permission", reqID+"\x1f"+tool+"\x1fb64:"+base64.StdEncoding.EncodeToString([]byte(detail)))
 		},
 	})
+	if errors.Is(err, agent.ErrCanceled) {
+		send("runId", runID)
+		send("stopped", "已按用户要求停止构建")
+		return
+	}
 	if err != nil {
 		send("error", "修改失败: "+err.Error())
 		return
 	}
-	send("done", toJSON(gin.H{"project": projectBrief(*updated)}))
+	send("done", toJSON(gin.H{"project": projectBrief(*updated), "runId": runID}))
 }

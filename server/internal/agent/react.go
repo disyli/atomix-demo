@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -183,6 +184,11 @@ func (rt *reactSession) liveRun(ctx context.Context) error {
 	}
 	loops, repairs := 0, 0
 	for {
+		// 用户停止检查点：每轮循环、每次模型调用与每个工具执行前都会检查
+		if ctx.Err() != nil {
+			rt.stage("done", "已按用户要求停止构建")
+			return ErrCanceled
+		}
 		loops++
 		if loops > loopCap {
 			if rt.html == "" {
@@ -194,6 +200,10 @@ func (rt *reactSession) liveRun(ctx context.Context) error {
 
 		resp, err := rt.a.LLM.ChatWithTools(ctx, messages, rt.activeTools(), reactTemperature, reactMaxTokens)
 		if err != nil {
+			if ctx.Err() != nil {
+				rt.stage("done", "已按用户要求停止构建")
+				return ErrCanceled
+			}
 			if rt.html != "" {
 				rt.detail("build", "模型调用失败，以已有产物收尾："+err.Error(), "warn")
 				break
@@ -225,8 +235,13 @@ func (rt *reactSession) liveRun(ctx context.Context) error {
 		messages = append(messages, llm.ChatMessage{Role: "assistant", Content: resp.Content, ToolCalls: resp.ToolCalls})
 		shouldStop := false
 		for _, tc := range resp.ToolCalls {
+			// 用户停止检查点：工具之间也可退出
+			if ctx.Err() != nil {
+				rt.stage("done", "已按用户要求停止构建")
+				return ErrCanceled
+			}
 			// 权限网关：ask 级工具先向用户推送确认卡片，拒绝/超时则拦截并把结果回喂模型
-			allowed, denyMsg := rt.perm.authorize(tc.Function.Name, permissionDetail(rt, tc.Function.Name, tc.Function.Arguments), rt.ev)
+			allowed, denyMsg := rt.perm.authorize(ctx, tc.Function.Name, permissionDetail(rt, tc.Function.Name, tc.Function.Arguments), rt.ev)
 			if !allowed {
 				messages = append(messages, llm.ChatMessage{Role: "tool", Content: denyMsg, ToolCallID: tc.ID})
 				rt.detail("observe", fmt.Sprintf("[%s] 权限拦截：%s", tc.Function.Name, truncateText(denyMsg, 120)), "warn")
@@ -286,6 +301,10 @@ func (rt *reactSession) act(tool, argsJSON string) {
 // demoRun 演示模式的脚本化 ReAct 轨迹：与真实循环同构（plan → write → checks(失败) → edit_file 精准修复 → checks(通过) → finish），
 // 工具全部真实执行，让评审者无 Key 也能观察到完整的 think→act→observe 闭环。
 func (rt *reactSession) demoRun() error {
+	if rt.ctx != nil && rt.ctx.Err() != nil {
+		rt.stage("done", "已按用户要求停止构建")
+		return ErrCanceled
+	}
 	rt.stage("plan", "Agent 正在理解需求并制定构建计划…")
 
 	rt.detail("think", "分析需求关键词，匹配内置模板能力清单，确定应用形态与构建步骤", "info")
@@ -535,6 +554,14 @@ func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, exis
 	rt.stage("plan", "Agent 已接管任务，开始分析需求…")
 
 	if err := rt.reactLoop(ctx); err != nil {
+		if errors.Is(err, ErrCanceled) {
+			// 用户主动停止：项目标记 stopped（区别于失败），事件留痕供历史回看
+			project.Status = "stopped"
+			project.UpdatedAtMs = store.Now()
+			store.DB.Model(project).Updates(map[string]interface{}{"status": "stopped", "updated_at_ms": project.UpdatedAtMs})
+			rt.appendEvent(project.ID, "done", "用户已停止本次构建", "warn")
+			return nil, err
+		}
 		project.Status = "failed"
 		project.UpdatedAtMs = store.Now()
 		store.DB.Model(project).Updates(map[string]interface{}{"status": "failed", "updated_at_ms": project.UpdatedAtMs})

@@ -21,6 +21,9 @@ const serverMode = ref('')
 const chatBox = ref(null)
 const composer = ref('')
 const running = ref(false)
+const currentRunId = ref('')
+let activeES = null // 运行中的 EventSource（停止时关闭）
+let activeRefineAbort = null // 迭代修改流的 AbortController（停止时中断）
 const mode = ref('build')
 const pendingAttachments = ref([])
 const fileInput = ref(null)
@@ -191,6 +194,45 @@ function failRun(run, text) {
   autoscroll()
 }
 
+// finishStopped 服务端 stopped 事件到达时的回合收尾（幂等，避免与 stopRun 本地收尾重复）
+function finishStopped(run) {
+  if (run.status !== 'running') return
+  if (run.pendingPerm) { run.pendingPerm = null; run.events.push({ stage: 'act', message: '已撤销待确认的权限请求', level: 'warn', ts: Date.now() }) }
+  stages.forEach(s => { if (run.stageState[s] === 'active') run.stageState[s] = 'done' })
+  run.status = 'stopped'
+  running.value = false
+  currentRunId.value = ''
+  autoscroll()
+}
+
+// 停止按钮：取消后端任务 + 断开前端 SSE + 当前回合标记已停止
+async function stopRun() {
+  if (!running.value) return
+  const run = [...thread.value].reverse().find(m => m.role === 'assistant' && m.status === 'running')
+  // 1. 通知后端取消（立即中断 LLM 调用与后续循环）
+  if (currentRunId.value) {
+    try {
+      await fetch('/api/runs/' + currentRunId.value + '/cancel', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + (localStorage.getItem('atomix_token') || '') }
+      })
+    } catch {}
+  }
+  // 2. 断开前端事件流
+  if (activeES) { activeES.close(); activeES = null }
+  if (activeRefineAbort) { try { activeRefineAbort.abort() } catch {} activeRefineAbort = null }
+  // 3. 回合收尾
+  if (run) {
+    if (run.pendingPerm) { run.pendingPerm = null; run.events.push({ stage: 'act', message: '已撤销待确认的权限请求', level: 'warn', ts: Date.now() }) }
+    stages.forEach(s => { if (run.stageState[s] === 'active') run.stageState[s] = 'done' })
+    run.status = 'stopped'
+    run.events.push({ stage: 'done', message: '已按用户要求停止构建', level: 'warn', ts: Date.now() })
+  }
+  running.value = false
+  currentRunId.value = ''
+  autoscroll()
+}
+
 /* ---------- 发送：新建 or 迭代修改 ---------- */
 
 function send() {
@@ -257,6 +299,15 @@ function generateSend(text, alreadyRouted, attachIds = []) {
     attachmentIds: attachIds.join(','), t: localStorage.getItem('atomix_token') || ''
   })
   const es = new EventSource('/api/generate?' + params.toString())
+  activeES = es
+  es.addEventListener('runId', e => {
+    currentRunId.value = e.data
+  })
+  es.addEventListener('stopped', () => {
+    finishStopped(run)
+    es.close()
+    if (activeES === es) activeES = null
+  })
   es.addEventListener('stage', e => {
     const [stage, message] = e.data.split('\x1f')
     applyStage(run, stage, message)
@@ -297,6 +348,8 @@ function generateSend(text, alreadyRouted, attachIds = []) {
     finishRun(run)
     loadProjects()
     es.close()
+    if (activeES === es) activeES = null
+    currentRunId.value = ''
   })
   es.addEventListener('error', e => {
     // 无数据 error = 连接层断开。权限等待最长 180s，期间任何网络抖动/代理超时都会触发，
@@ -347,10 +400,13 @@ async function refineSend(text, alreadyRouted, attachIds = []) {
   thread.value.push(run)
   scrollToBottom()
   try {
+    const abort = new AbortController()
+    activeRefineAbort = abort
     const resp = await fetch('/api/projects/' + pid + '/refine', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (localStorage.getItem('atomix_token') || '') },
-      body: JSON.stringify({ instruction: text, attachmentIds: attachIds })
+      body: JSON.stringify({ instruction: text, attachmentIds: attachIds }),
+      signal: abort.signal
     })
     if (!resp.ok || !resp.body) throw new Error('修改请求失败 (' + resp.status + ')')
     const reader = resp.body.getReader()
@@ -370,7 +426,11 @@ async function refineSend(text, alreadyRouted, attachIds = []) {
         const data = dataLines.join('\n')
         if (!evLine || !dataLines.length) continue
         const ev = evLine.slice(6).trim()
-        if (ev === 'stage') {
+        if (ev === 'runId') {
+          currentRunId.value = data
+        } else if (ev === 'stopped') {
+          finishStopped(run)
+        } else if (ev === 'stage') {
           const [stage, message] = data.split('\x1f')
           applyStage(run, stage, message)
         } else if (ev === 'detail') {
@@ -408,7 +468,13 @@ async function refineSend(text, alreadyRouted, attachIds = []) {
     else finishRun(run)
     loadProjects()
   } catch (e) {
+    if (e.name === 'AbortError') {
+      // stopRun 已完成收尾，这里只避免把主动停止误报为失败
+      return
+    }
     failRun(run, e.message || '修改失败')
+  } finally {
+    if (activeRefineAbort) activeRefineAbort = null
   }
 }
 
@@ -578,7 +644,7 @@ onBeforeUnmount(() => {
                 <div class="run-head">
                   <b>{{ m.projectName || 'Atomix' }}</b>
                   <span class="run-status" :class="m.status">
-                    {{ m.status === 'running' ? '构建中…' : m.status === 'failed' ? '构建失败' : '已完成' }}
+                    {{ m.status === 'running' ? '构建中…' : m.status === 'failed' ? '构建失败' : m.status === 'stopped' ? '已停止' : '已完成' }}
                   </span>
                 </div>
 
@@ -682,9 +748,11 @@ onBeforeUnmount(() => {
                   </button>
                 </div>
               </div>
-              <button class="go" :disabled="running || !composer.trim()" @click="send" :title="running ? '构建中…' : '发送'">
-                <svg v-if="!running" viewBox="0 0 16 16" width="15" height="15" fill="none"><path d="M2 8h10M8.5 3.5 13 8l-4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                <span v-else class="spin">◐</span>
+              <button v-if="running" class="go stop" @click="stopRun" title="停止构建">
+                <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><rect x="3.5" y="3.5" width="9" height="9" rx="1.5"/></svg>
+              </button>
+              <button v-else class="go" :disabled="!composer.trim()" @click="send" title="发送">
+                <svg viewBox="0 0 16 16" width="15" height="15" fill="none"><path d="M2 8h10M8.5 3.5 13 8l-4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
               </button>
             </div>
           </div>
@@ -994,6 +1062,9 @@ onBeforeUnmount(() => {
 .go:hover:not(:disabled) { background: var(--indigo-600); }
 .go:active:not(:disabled) { transform: scale(.95); }
 .go:disabled { background: var(--paper-300); color: var(--paper-50); cursor: default; }
+.go.stop { background: var(--red); }
+.go.stop:hover { background: #a93a40; }
+.run-status.stopped { color: var(--amber); background: rgba(192, 127, 16, .1); }
 .spin { display: inline-block; animation: rot 1s linear infinite; font-size: 16px; }
 @keyframes rot { to { transform: rotate(360deg); } }
 .composer-hint {

@@ -16,11 +16,13 @@ type Agent struct {
 	CurrentUserID uint // 最近一次请求的用户 ID，用于附件归属校验
 	// PermRegistry 跨任务权限确认注册表：HTTP 确认接口按请求 ID 回填用户决定
 	PermRegistry *PermRegistry
+	// Runs 活跃构建任务注册表：停止按钮经 /api/runs/:runId/cancel 取消运行中的任务
+	Runs *RunRegistry
 }
 
-// NewAgent 构造带默认组件的 Agent（权限注册表必初始化）。
+// NewAgent 构造带默认组件的 Agent（权限注册表与任务注册表必初始化）。
 func NewAgent(svc llm.Service, useMock bool) *Agent {
-	return &Agent{LLM: svc, UseMock: useMock, PermRegistry: NewPermRegistry()}
+	return &Agent{LLM: svc, UseMock: useMock, PermRegistry: NewPermRegistry(), Runs: NewRunRegistry()}
 }
 
 // PipelineEvents 流水线事件回调。
