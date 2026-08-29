@@ -5,13 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"atomix-demo/server/internal/llm"
-	"atomix-demo/server/internal/store"
 )
 
-// Agent 负责编排一次应用生成流水线。
+// Agent 负责编排一次应用生成任务。
 type Agent struct {
 	LLM     llm.Service
 	UseMock bool
@@ -23,70 +21,7 @@ type PipelineEvents struct {
 	OnDetail func(stage, message, level string)
 }
 
-// Run 执行完整流水线：规划 -> 构建 -> 运行 -> 校验 -> 完成。
-func (a *Agent) Run(ctx context.Context, userID uint, brief string, ev PipelineEvents) (*store.Project, error) {
-	stage := func(stage, msg string) {
-		if ev.OnStage != nil {
-			ev.OnStage(stage, msg)
-		}
-	}
-	detail := func(stage, msg, level string) {
-		if ev.OnDetail != nil {
-			ev.OnDetail(stage, msg, level)
-		}
-	}
-
-	// ---- 规划阶段 ----
-	stage("plan", "Agent 正在理解需求并制定构建计划…")
-	plan := a.makePlan(ctx, brief)
-	detail("plan", fmt.Sprintf("选择模板 %s：%s", plan.Template, plan.Reason), "info")
-	for _, s := range plan.Steps {
-		detail("plan", fmt.Sprintf("Step %d · %s", s.ID, s.Title), "info")
-	}
-	a.appendEvents(userID, plan, brief, "plan")
-
-	// ---- 构建阶段 ----
-	stage("build", "正在生成应用代码…")
-	html := a.generateHTML(ctx, brief, plan)
-	detail("build", fmt.Sprintf("已生成完整单文件应用（约 %d 字符）", len(html)), "info")
-	a.appendEvents(userID, plan, brief, "build")
-
-	// ---- 运行阶段（模拟部署预览环境）----
-	stage("run", "正在启动预览环境…")
-	time.Sleep(400 * time.Millisecond)
-	detail("run", "预览沙箱已就绪（sandboxed iframe）", "info")
-
-	// ---- 校验阶段 ----
-	stage("verify", "正在校验产物…")
-	lower := strings.ToLower(html)
-	if !strings.Contains(lower, "<!doctype html") && !strings.Contains(lower, "<html") {
-		detail("verify", "产物缺少 HTML 文档结构，已回退到模板兜底", "warn")
-		_, html, _ = RenderTemplate(Match(brief), plan.AppName)
-	} else {
-		detail("verify", "HTML 结构完整，允许在沙箱中渲染", "info")
-	}
-
-	// ---- 持久化 ----
-	now := store.Now()
-	project := &store.Project{
-		UserID:      userID,
-		Name:        plan.AppName,
-		Brief:       brief,
-		Template:    plan.Template,
-		HTML:        html,
-		Status:      "ready",
-		CreatedAtMs: now,
-		UpdatedAtMs: now,
-	}
-	if err := store.DB.Create(project).Error; err != nil {
-		return nil, err
-	}
-	a.appendEvents(userID, plan, brief, "verify")
-	a.appendEvents(userID, plan, brief, "done")
-	stage("done", "构建完成，预览已就绪 🎉")
-	return project, nil
-}
-
+// makePlan 旧版独立规划（保留给规划回退与单测使用；主流程由 ReAct 循环内的 plan_app 工具承担）。
 func (a *Agent) makePlan(ctx context.Context, brief string) PlanResult {
 	if a.UseMock {
 		return mockPlan(brief)
@@ -122,24 +57,32 @@ func (a *Agent) makePlan(ctx context.Context, brief string) PlanResult {
 	return plan
 }
 
-func (a *Agent) generateHTML(ctx context.Context, brief string, plan PlanResult) string {
+// generateHTMLWith 调用 LLM 生成单文件应用。refineTo 非空时为迭代修改：附上当前产物全文做最小化修改。
+func (a *Agent) generateHTMLWith(ctx context.Context, brief string, plan PlanResult, currentHTML, refineTo string) string {
 	if a.UseMock {
 		_, html, _ := RenderTemplate(plan.Template, plan.AppName)
 		return html
 	}
 	info, _ := Get(plan.Template)
 	caps := strings.Join(append(append(append([]string{}, info.Assets...), info.Build...), info.Scripts...), "、")
-	prompt := fmt.Sprintf(`为以下需求生成一个完整的单文件网页应用（一个完整的 <!DOCTYPE html> 文档）：
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(`为以下需求生成一个完整的单文件网页应用（一个完整的 <!DOCTYPE html> 文档）：
 """%s"""
 应用名：%s
 实现要求：使用 HTML + CSS + 原生 JavaScript（可用 Tailwind CDN），必须包含：%s。
 硬性要求：
 1. 数据使用 localStorage 持久化，刷新不丢失
 2. UI 精致现代，中文界面，含交互反馈
-3. 只输出 HTML 代码，不要任何解释`, brief, plan.AppName, caps)
+3. 只输出 HTML 代码，不要任何解释
+4. 禁止使用 document.cookie（沙箱环境不支持）`, brief, plan.AppName, caps))
+	if refineTo != "" && currentHTML != "" {
+		sb.WriteString("\n\n这是对已有应用的迭代修改请求：" + refineTo)
+		sb.WriteString("\n\n当前应用完整代码如下，请在其基础上最小化修改后输出完整新文档：\n```html\n" + currentHTML + "\n```")
+	}
 	html, err := a.LLM.ChatHTML(ctx, []llm.ChatMessage{
 		{Role: "system", Content: "你是一个资深前端工程师，只输出完整 HTML 代码。"},
-		{Role: "user", Content: prompt},
+		{Role: "user", Content: sb.String()},
 	})
 	if err != nil {
 		_, fallback, _ := RenderTemplate(plan.Template, plan.AppName)
@@ -148,22 +91,7 @@ func (a *Agent) generateHTML(ctx context.Context, brief string, plan PlanResult)
 	return html
 }
 
-// appendEvents 将某阶段的标准事件写入数据库。
-func (a *Agent) appendEvents(userID uint, plan PlanResult, brief, stage string) {
-	events := StageEvents(stage, plan, brief, a.UseMock)
-	if len(events) == 0 {
-		return
-	}
-	pid := a.latestProjectID(userID)
-	for _, e := range events {
-		store.DB.Create(&store.Event{ProjectID: pid, Stage: e.Stage, Message: e.Message, Level: e.Level, TsMs: store.Now()})
-	}
-}
-
-func (a *Agent) latestProjectID(userID uint) uint {
-	var p store.Project
-	if err := store.DB.Where("user_id = ?", userID).Order("id DESC").First(&p).Error; err != nil {
-		return 0
-	}
-	return p.ID
+// generateHTML 兼容旧调用（无迭代上下文）。
+func (a *Agent) generateHTML(ctx context.Context, brief string, plan PlanResult) string {
+	return a.generateHTMLWith(ctx, brief, plan, "", "")
 }

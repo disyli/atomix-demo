@@ -23,13 +23,17 @@ type chatRequest struct {
 	Messages    []ChatMessage `json:"messages"`
 	Temperature float64       `json:"temperature"`
 	MaxTokens   int           `json:"max_tokens"`
+	Tools       []Tool        `json:"tools,omitempty"`
 }
 
 type chatResponse struct {
 	Choices []struct {
 		Message struct {
-			Content string `json:"content"`
+			Role      string     `json:"role"`
+			Content   string     `json:"content"`
+			ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
@@ -47,8 +51,45 @@ func NewDeepSeek(opts Options) *DeepSeekService {
 	return &DeepSeekService{opts: opts, hc: &http.Client{Timeout: 180 * time.Second}}
 }
 
+func (s *DeepSeekService) callRaw(ctx context.Context, req chatRequest) (*chatResponse, error) {
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.opts.BaseURL+"/chat/completions", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+s.opts.APIKey)
+
+	resp, err := s.hc.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("deepseek http %d: %s", resp.StatusCode, truncate(string(body), 300))
+	}
+	var out chatResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, err
+	}
+	if out.Error != nil {
+		return nil, fmt.Errorf("deepseek api: %s", out.Error.Message)
+	}
+	if len(out.Choices) == 0 {
+		return nil, fmt.Errorf("deepseek empty choices")
+	}
+	return &out, nil
+}
+
 func (s *DeepSeekService) call(ctx context.Context, messages []ChatMessage, temperature float64, maxTokens int) (string, error) {
-	payload, err := json.Marshal(chatRequest{
+	out, err := s.callRaw(ctx, chatRequest{
 		Model:       s.opts.Model,
 		Messages:    messages,
 		Temperature: temperature,
@@ -56,35 +97,6 @@ func (s *DeepSeekService) call(ctx context.Context, messages []ChatMessage, temp
 	})
 	if err != nil {
 		return "", err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.opts.BaseURL+"/chat/completions", bytes.NewReader(payload))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.opts.APIKey)
-
-	resp, err := s.hc.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("deepseek http %d: %s", resp.StatusCode, truncate(string(body), 300))
-	}
-	var out chatResponse
-	if err := json.Unmarshal(body, &out); err != nil {
-		return "", err
-	}
-	if out.Error != nil {
-		return "", fmt.Errorf("deepseek api: %s", out.Error.Message)
-	}
-	if len(out.Choices) == 0 {
-		return "", fmt.Errorf("deepseek empty choices")
 	}
 	return out.Choices[0].Message.Content, nil
 }
@@ -105,6 +117,26 @@ func (s *DeepSeekService) ChatHTML(ctx context.Context, messages []ChatMessage) 
 		return "", err
 	}
 	return extractHTML(text), nil
+}
+
+// ChatWithTools 执行一次带工具定义的对话，返回内容与工具调用意图（ReAct 循环的核心调用）。
+func (s *DeepSeekService) ChatWithTools(ctx context.Context, messages []ChatMessage, tools []Tool, temperature float64, maxTokens int) (*ToolCallResponse, error) {
+	out, err := s.callRaw(ctx, chatRequest{
+		Model:       s.opts.Model,
+		Messages:    messages,
+		Temperature: temperature,
+		MaxTokens:   maxTokens,
+		Tools:       tools,
+	})
+	if err != nil {
+		return nil, err
+	}
+	choice := out.Choices[0]
+	return &ToolCallResponse{
+		Content:      choice.Message.Content,
+		ToolCalls:    choice.Message.ToolCalls,
+		FinishReason: choice.FinishReason,
+	}, nil
 }
 
 func truncate(s string, n int) string {

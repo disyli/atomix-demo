@@ -24,6 +24,8 @@ export const api = {
   listProjects: () => request('/api/projects'),
   getProject: (id) => request('/api/projects/' + id),
   getEvents: (id) => request('/api/projects/' + id + '/events'),
+  // 迭代修改：在已有项目上追加自然语言修改指令（后端走 ReAct 循环）
+  refine: (id, instruction) => request('/api/projects/' + id + '/refine', { method: 'POST', body: JSON.stringify({ instruction }) }),
   // 预览接口由 iframe 直接加载，无法携带 Authorization 头，
   // 与 SSE 一样通过 t 查询参数传递 token（后端中间件支持）。
   // payload 为应用历史数据（键值对），经 location.hash 传给沙箱内存储垫片。

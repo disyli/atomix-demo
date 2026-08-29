@@ -115,6 +115,71 @@ function generate() {
   })
 }
 
+/* ---------- 迭代修改（ReAct 循环） ---------- */
+const refineText = ref('')
+const refining = ref(false)
+
+async function refineProject() {
+  const text = refineText.value.trim()
+  if (!text || refining.value || !activeProject.value) return
+  refining.value = true
+  errorMsg.value = ''
+  const pid = activeProject.value.id
+  activeEvents.value = []
+  try {
+    const resp = await fetch('/api/projects/' + pid + '/refine', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (localStorage.getItem('atomix_token') || '') },
+      body: JSON.stringify({ instruction: text })
+    })
+    if (!resp.ok || !resp.body) throw new Error('修改请求失败 (' + resp.status + ')')
+    const es = resp.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    let updatedProject = null
+    while (true) {
+      const { done, value } = await es.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const chunks = buf.split('\n\n')
+      buf = chunks.pop()
+      for (const chunk of chunks) {
+        const evLine = chunk.split('\n').find(l => l.startsWith('event:'))
+        const dataLine = chunk.split('\n').find(l => l.startsWith('data:'))
+        if (!evLine || !dataLine) continue
+        const event = evLine.slice(6).trim()
+        const data = dataLine.slice(5).trim()
+        if (event === 'stage') {
+          const [stage, message] = data.split('\x1f')
+          timeline.value.push({ stage, message, level: 'stage', ts: Date.now() })
+        } else if (event === 'detail') {
+          const [stage, message, level] = data.split('\x1f')
+          timeline.value.push({ stage, message, level, ts: Date.now() })
+        } else if (event === 'done') {
+          try { updatedProject = JSON.parse(data).project } catch {}
+        } else if (event === 'error') {
+          errorMsg.value = data
+        }
+      }
+      nextTick(scrollTimeline)
+    }
+    if (updatedProject) {
+      activeProject.value = updatedProject
+      previewUrl.value = api.previewUrl(pid, readAppData(pid))
+      // 刷新 iframe 使新产物生效
+      previewUrl.value = previewUrl.value
+      try { activeEvents.value = await api.getEvents(pid) } catch {}
+      loadProjects()
+    }
+    refineText.value = ''
+  } catch (e) {
+    errorMsg.value = e.message || '修改失败'
+  } finally {
+    refining.value = false
+    nextTick(scrollTimeline)
+  }
+}
+
 /* ---------- 历史项目 ---------- */
 const APP_DATA_PREFIX = 'atomix_app_'
 function readAppData(projectId) {
@@ -229,7 +294,12 @@ onBeforeUnmount(() => window.removeEventListener('message', onShimMessage))
               class="tl-item"
               :class="t.level"
             >
-              <span class="tl-stage">{{ stageMeta[t.stage] ? stageMeta[t.stage].label : t.stage }}</span>
+              <span class="tl-stage">
+                <template v-if="t.stage === 'think'">🧠 思考</template>
+                <template v-else-if="t.stage === 'act'">⚡ 行动</template>
+                <template v-else-if="t.stage === 'observe'">👁 观察</template>
+                <template v-else>{{ stageMeta[t.stage] ? stageMeta[t.stage].label : t.stage }}</template>
+              </span>
               <span class="tl-msg">{{ t.message }}</span>
               <span class="tl-time">{{ new Date(t.ts).toLocaleTimeString() }}</span>
             </div>
@@ -258,6 +328,17 @@ onBeforeUnmount(() => window.removeEventListener('message', onShimMessage))
               <b>{{ activeProject.name }}</b>
               <span class="meta">{{ activeProject.template }} · {{ activeProject.status }}</span>
               <a v-if="previewUrl" :href="previewUrl" target="_blank" class="open-link">新窗口打开 ↗</a>
+            </div>
+            <div class="refine-bar">
+              <input
+                v-model="refineText"
+                :disabled="refining"
+                placeholder="继续修改：例如「加上深色模式」「把主色改成绿色」…"
+                @keydown.enter="refineProject"
+              />
+              <button class="refine-go" :disabled="refining || !refineText.trim()" @click="refineProject">
+                {{ refining ? '修改中…' : '发送' }}
+              </button>
             </div>
             <iframe
               v-if="previewUrl"
@@ -449,6 +530,40 @@ textarea:focus { background: var(--beige-50); border-color: var(--blue-500); }
 .tl-item.stage { background: var(--blue-50); font-weight: 600; color: var(--blue-600); }
 .tl-item.warn { background: rgba(239, 174, 34, .1); color: #a87707; }
 .tl-item.err { background: rgba(201, 68, 74, .08); color: var(--red); }
+/* ReAct 三类事件 */
+.tl-item.think { background: var(--beige-50); border: 1px dashed var(--line); }
+.tl-item.think .tl-msg { color: var(--ink-55); }
+.tl-item.act { background: rgba(66, 103, 255, .06); }
+.tl-item.act .tl-msg { color: var(--blue-600); font-family: var(--font-mono); font-size: 12px; }
+.tl-item.observe { background: rgba(15, 139, 141, .06); }
+.tl-item.observe .tl-msg { color: #0b5f60; }
+
+/* 继续修改输入条 */
+.refine-bar {
+  display: flex; gap: 8px; padding: 10px 18px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--beige-50);
+}
+.refine-bar input {
+  flex: 1;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-full);
+  background: var(--beige-100);
+  color: var(--ink-100);
+  padding: 9px 15px;
+  font-size: 13px;
+  outline: none;
+  transition: border-color .18s ease;
+}
+.refine-bar input:focus { border-color: var(--blue-500); background: #fff; }
+.refine-go {
+  background: var(--blue-500); color: #fff;
+  border-radius: var(--r-full);
+  padding: 0 18px; font-size: 13px; font-weight: 600;
+  transition: background .18s ease;
+}
+.refine-go:hover:not(:disabled) { background: var(--blue-600); }
+.refine-go:disabled { background: var(--beige-300); color: var(--beige-50); cursor: default; }
 .tl-stage { color: var(--ink-30); font-size: 11px; flex-shrink: 0; font-family: var(--font-mono); }
 .tl-item.stage .tl-stage { color: var(--blue-500); }
 .tl-msg { flex: 1; color: var(--ink-80); }

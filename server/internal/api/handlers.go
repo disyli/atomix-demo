@@ -40,6 +40,7 @@ func Register(r *gin.Engine, h *Handlers) {
 	authed.GET("/projects/:id/events", h.getEvents)
 	authed.GET("/projects/:id/preview", h.previewHTML)
 	authed.GET("/generate", h.generateSSE)
+	authed.POST("/projects/:id/refine", h.refineSSE)
 }
 
 func modeName(useMock bool) string {
@@ -334,4 +335,50 @@ func (h *Handlers) generateSSE(c *gin.Context) {
 	store.DB.Where("project_id = ?", project.ID).Order("id ASC").Find(&es)
 	payload := gin.H{"project": projectBrief(*project)}
 	c.SSEvent("done", toJSON(payload))
+}
+
+// refineSSE 以 SSE 流式推送一次迭代修改任务（ReAct 循环）。
+func (h *Handlers) refineSSE(c *gin.Context) {
+	uid := middleware.UID(c)
+	var req struct {
+		Instruction string `json:"instruction"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Instruction == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "修改指令不能为空"})
+		return
+	}
+	var p store.Project
+	if err := store.DB.Where("id = ? AND user_id = ?", c.Param("id"), uid).First(&p).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "项目不存在"})
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.String(http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+	send := func(event, data string) {
+		c.SSEvent(event, data)
+		flusher.Flush()
+	}
+
+	updated, err := h.Agent.Refine(c.Request.Context(), uid, p.ID, req.Instruction, agent.PipelineEvents{
+		OnStage: func(stage, message string) {
+			send("stage", stage+"\x1f"+message)
+		},
+		OnDetail: func(stage, message, level string) {
+			send("detail", stage+"\x1f"+message+"\x1f"+level)
+		},
+	})
+	if err != nil {
+		send("error", "修改失败: "+err.Error())
+		return
+	}
+	send("done", toJSON(gin.H{"project": projectBrief(*updated)}))
 }
