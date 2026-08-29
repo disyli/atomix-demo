@@ -1,47 +1,69 @@
-/* Atoms 视觉体系 —— 浅色米白底 + 品牌蓝 + 胶囊圆角 + Inter */
+/* Atomix 视觉体系 —— 「纸感工程手稿」：暖纸底 + 深墨蓝 + 靛蓝/青绿双主色 + 衬线标题 */
 :root {
-  /* 品牌色板（取自 Atoms 设计 token） */
-  --beige-50: #ffffff;
-  --beige-100: #f6f6f6;
-  --beige-150: #f1f1f1;
-  --beige-200: #ebebea;
-  --beige-300: #e1e0e0;
+  /* 纸感基底 */
+  --paper-50: #ffffff;
+  --paper-100: #faf8f3;
+  --paper-150: #f3efe7;
+  --paper-200: #eae5da;
+  --paper-300: #d9d2c3;
 
-  --ink-100: #0c0c0c;            /* 主文字 墨黑 */
-  --ink-80: rgba(12, 12, 12, .8);
-  --ink-55: rgba(12, 12, 12, .55);
-  --ink-30: rgba(12, 12, 12, .3);
-  --line: rgba(12, 12, 12, .12);
-  --line-soft: rgba(12, 12, 12, .06);
+  /* 墨色（深墨蓝，非纯黑） */
+  --ink-100: #1c2333;
+  --ink-80: rgba(28, 35, 51, .82);
+  --ink-55: rgba(28, 35, 51, .56);
+  --ink-30: rgba(28, 35, 51, .32);
+  --line: rgba(28, 35, 51, .14);
+  --line-soft: rgba(28, 35, 51, .07);
 
-  --blue-500: #4267ff;           /* 品牌主色 */
-  --blue-600: #425ce1;           /* 深压 / hover */
-  --blue-100: #dde7ff;
-  --blue-50: #ecf1ff;
+  /* 双主色：靛蓝（行动） + 青绿（信号/辅助） */
+  --indigo-500: #3d4fc4;
+  --indigo-600: #32409f;
+  --indigo-50: #edf0fb;
+  --indigo-100: #dee4f8;
 
-  --green: #2dbb5c;
-  --orange: #efae22;
-  --red: #c9444a;
+  --teal-500: #0f8f85;
+  --teal-600: #0b6e66;
+  --teal-50: #e4f4f1;
+  --teal-100: #c9e7e2;
+
+  /* 信号色 */
+  --green: #2e9e5b;
+  --amber: #c07f10;
+  --red: #c14a50;
 
   /* 语义别名 */
-  --bg: var(--beige-100);
-  --panel: var(--beige-50);
-  --panel-2: var(--beige-150);
+  --bg: var(--paper-100);
+  --panel: var(--paper-50);
+  --panel-2: var(--paper-150);
   --text: var(--ink-100);
   --muted: var(--ink-55);
   --border: var(--line);
-  --accent: var(--blue-500);
-  --accent-2: var(--blue-600);
+  --accent: var(--indigo-500);
+  --accent-2: var(--teal-500);
 
-  /* 圆角 */
+  /* 兼容旧 token（避免遗漏引用失效） */
+  --beige-50: var(--paper-50);
+  --beige-100: var(--paper-100);
+  --beige-150: var(--paper-150);
+  --beige-200: var(--paper-200);
+  --beige-300: var(--paper-300);
+  --blue-500: var(--indigo-500);
+  --blue-600: var(--indigo-600);
+  --blue-100: var(--indigo-100);
+  --blue-50: var(--indigo-50);
+  --orange: var(--amber);
+
+  /* 圆角：克制的小圆角，告别通篇胶囊 */
   --r-s: 8px;
   --r-m: 12px;
   --r-l: 16px;
   --r-full: 999px;
 
-  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, "PingFang SC",
-    "Noto Sans", "Helvetica Neue", "Microsoft YaHei", sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* 字体：衬线展示 + 几何人文正文 + 工程等宽 */
+  --font-display: "Fraunces", "Noto Serif SC", "Songti SC", "SimSun", serif;
+  --font-sans: "Manrope", ui-sans-serif, system-ui, "PingFang SC", "MiSans",
+    "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -58,7 +80,21 @@ body {
 button { font-family: inherit; cursor: pointer; border: none; background: none; color: inherit; }
 input, textarea, select { font-family: inherit; }
 a { color: var(--accent); text-decoration: none; }
-::selection { background: var(--blue-100); }
+
+::selection { background: var(--teal-100); color: var(--ink-100); }
+:focus-visible { outline: 2px solid var(--indigo-500); outline-offset: 2px; border-radius: 4px; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb { background: var(--beige-300); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb { background: var(--paper-300); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* 通用工具类 */
+.serif { font-family: var(--font-display); }
+.eyebrow {
+  font-family: var(--font-mono); font-size: 10px; font-weight: 600;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--ink-30);
+}
+/* 蓝图点阵：用于 hero 区背景 */
+.bp-grid {
+  background-image: radial-gradient(var(--line-soft) 1px, transparent 1.2px);
+  background-size: 26px 26px;
+}

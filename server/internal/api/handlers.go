@@ -357,7 +357,9 @@ func (h *Handlers) generateSSE(c *gin.Context) {
 			send("detail", stage+"\x1f"+message+"\x1f"+level)
 		},
 		OnPermission: func(reqID, tool, detail string) {
-			send("permission", reqID+"\x1f"+tool+"\x1f"+detail)
+			// detail 含多行 diff：base64 编码为单行载荷下发（前缀 b64:），
+			// 规避 gin SSEvent 多行 data 编码缺陷与 \x1f 歧义；前端解码渲染
+			send("permission", reqID+"\x1f"+tool+"\x1fb64:"+base64.StdEncoding.EncodeToString([]byte(detail)))
 		},
 	})
 	if err != nil {
@@ -411,7 +413,8 @@ func (h *Handlers) refineSSE(c *gin.Context) {
 			send("detail", stage+"\x1f"+message+"\x1f"+level)
 		},
 		OnPermission: func(reqID, tool, detail string) {
-			send("permission", reqID+"\x1f"+tool+"\x1f"+detail)
+			// 与 generateSSE 相同：diff 多行内容 base64 单行下发
+			send("permission", reqID+"\x1f"+tool+"\x1fb64:"+base64.StdEncoding.EncodeToString([]byte(detail)))
 		},
 	})
 	if err != nil {
