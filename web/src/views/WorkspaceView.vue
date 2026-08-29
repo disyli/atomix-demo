@@ -500,9 +500,8 @@ onBeforeUnmount(() => {
                 </div>
                 <div v-if="m.status === 'failed'" class="run-error">{{ m.errorText }}</div>
               </div>
-    <input ref="fileInput" type="file" multiple hidden @change="onFiles" accept="image/*,.txt,.md,.json,.csv,.js,.html,.css" />
-  </div>
-</template>
+            </div>
+          </template>
         </div>
 
         <!-- 底部输入区（固定） -->
