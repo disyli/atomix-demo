@@ -301,6 +301,23 @@ func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, exis
 	if err := store.DB.Create(project).Error; err != nil {
 		return nil, err
 	}
+
+	// 事件实时落库：SSE 推送的同时写入 Event 表，历史回看可完整回放 ReAct 轨迹
+	if rt.ev.OnStage != nil {
+		userStage := rt.ev.OnStage
+		rt.ev.OnStage = func(stage, message string) {
+			userStage(stage, message)
+			store.DB.Create(&store.Event{ProjectID: project.ID, Stage: stage, Message: message, Level: "stage", TsMs: store.Now()})
+		}
+	}
+	if rt.ev.OnDetail != nil {
+		userDetail := rt.ev.OnDetail
+		rt.ev.OnDetail = func(stage, message, level string) {
+			userDetail(stage, message, level)
+			store.DB.Create(&store.Event{ProjectID: project.ID, Stage: stage, Message: message, Level: level, TsMs: store.Now()})
+		}
+	}
+
 	rt.stage("plan", "Agent 已接管任务，开始分析需求…")
 
 	if err := rt.reactLoop(ctx); err != nil {
