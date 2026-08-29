@@ -135,6 +135,29 @@ function applyDetail(run, stage, message, level) {
   run.events.push({ stage, message, level, ts: Date.now() })
   autoscroll()
 }
+function applyPermission(run, reqId, tool, detail) {
+  run.pendingPerm = { reqId, tool, detail }
+  run.events.push({ stage: 'act', message: '权限确认请求 [' + tool + ']：' + detail, level: 'warn', ts: Date.now() })
+  autoscroll()
+}
+async function resolvePerm(run, action) {
+  const perm = run.pendingPerm
+  if (!perm) return
+  run.pendingPerm = null
+  try {
+    await fetch('/api/permissions/' + perm.reqId, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (localStorage.getItem('atomix_token') || '') },
+      body: JSON.stringify({ action })
+    })
+  } catch {}
+  if (action === 'reject') {
+    run.events.push({ stage: 'act', message: '用户拒绝了本次写入操作', level: 'warn', ts: Date.now() })
+  } else {
+    run.events.push({ stage: 'act', message: action === 'allow_session' ? '已允许并在本次构建中记住选择' : '已允许本次操作', level: 'info', ts: Date.now() })
+  }
+  autoscroll()
+}
 function finishRun(run) {
   stages.forEach(s => { run.stageState[s] = 'done' })
   run.status = 'done'
@@ -226,6 +249,10 @@ function generateSend(text, alreadyRouted, attachIds = []) {
     const [stage, message, level] = e.data.split('\x1f')
     applyDetail(run, stage, message, level)
   })
+  es.addEventListener('permission', e => {
+    const [reqId, tool, detail] = e.data.split('\x1f')
+    applyPermission(run, reqId, tool, detail)
+  })
   es.addEventListener('done', e => {
     try {
       const data = JSON.parse(e.data)
@@ -281,6 +308,9 @@ async function refineSend(text, alreadyRouted, attachIds = []) {
         } else if (ev === 'detail') {
           const [stage, message, level] = data.split('\x1f')
           applyDetail(run, stage, message, level)
+        } else if (ev === 'permission') {
+          const [reqId, tool, detail] = data.split('\x1f')
+          applyPermission(run, reqId, tool, detail)
         } else if (ev === 'done') {
           try {
             const d = JSON.parse(data)
@@ -490,6 +520,17 @@ onBeforeUnmount(() => {
                       <span class="tl-msg">{{ t.message }}</span>
                       <span class="tl-time">{{ new Date(t.ts).toLocaleTimeString() }}</span>
                     </div>
+                  </div>
+                </div>
+
+                <!-- 权限确认卡片 -->
+                <div v-if="m.pendingPerm" class="perm-card">
+                  <div class="perm-head">🔐 写入确认 · {{ m.pendingPerm.tool }}</div>
+                  <div class="perm-detail">{{ m.pendingPerm.detail }}</div>
+                  <div class="perm-actions">
+                    <button class="perm-btn primary" @click="resolvePerm(m, 'allow')">允许本次</button>
+                    <button class="perm-btn" @click="resolvePerm(m, 'allow_session')">允许并记住</button>
+                    <button class="perm-btn danger" @click="resolvePerm(m, 'reject')">拒绝</button>
                   </div>
                 </div>
 
@@ -752,6 +793,26 @@ onBeforeUnmount(() => {
 
 /* 结果与错误 */
 .run-result { display: flex; align-items: center; gap: 12px; margin-top: 10px; font-size: 13.5px; color: var(--ink-80); }
+
+/* 权限确认卡片 */
+.perm-card {
+  margin-top: 10px; padding: 12px 14px;
+  background: rgba(239, 174, 34, .07); border: 1px solid rgba(239, 174, 34, .35);
+  border-radius: var(--r-m);
+}
+.perm-head { font-size: 13px; font-weight: 700; color: #a87707; margin-bottom: 5px; }
+.perm-detail { font-size: 12.5px; color: var(--ink-80); line-height: 1.6; margin-bottom: 10px; font-family: var(--font-mono); word-break: break-all; }
+.perm-actions { display: flex; gap: 8px; }
+.perm-btn {
+  border: 1px solid var(--line); border-radius: var(--r-full);
+  padding: 6px 14px; font-size: 12.5px; font-weight: 600; color: var(--ink-55);
+  background: var(--beige-50); transition: all .18s ease;
+}
+.perm-btn.primary { color: #fff; background: var(--blue-500); border-color: var(--blue-500); }
+.perm-btn.primary:hover { background: var(--blue-600); }
+.perm-btn.danger { color: var(--red); border-color: rgba(201, 68, 74, .3); }
+.perm-btn.danger:hover { background: rgba(201, 68, 74, .08); }
+.perm-btn:hover:not(.primary):not(.danger) { color: var(--ink-100); border-color: var(--ink-30); }
 .view-btn {
   color: var(--blue-500); font-weight: 600; font-size: 12.5px;
   border: 1px solid rgba(66, 103, 255, .3); border-radius: var(--r-full);

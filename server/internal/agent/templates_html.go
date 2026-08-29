@@ -32,8 +32,8 @@ func RenderTemplate(id, appName string) (TplInfo, string, error) {
 }
 
 var htmlTemplates = map[string]*template.Template{
-	"todo": template.Must(template.New("todo").Parse(todoHTML)),
-	"notes": template.Must(template.New("notes").Parse(notesHTML)),
+	"todo":   template.Must(template.New("todo").Parse(todoHTML)),
+	"notes":  template.Must(template.New("notes").Parse(notesHTML)),
 	"kanban": template.Must(template.New("kanban").Parse(kanbanHTML)),
 }
 

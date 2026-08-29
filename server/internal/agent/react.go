@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	maxReActLoops    = 12 // 单次任务的工具调用轮数上限，防失控
+	maxReActLoops    = 12 // 单次任务的工具调用轮数上限，防失控（规划模式另加预算）
 	maxAutoRepairs   = 3  // 校验失败后的自动修复次数上限
 	reactMaxTokens   = 8192
 	reactTemperature = 0.4
@@ -19,16 +19,24 @@ const (
 
 // reactSession 一次 ReAct 任务会话：持有状态、推送事件、驱动 think→act→observe 循环。
 type reactSession struct {
-	a           *Agent
-	ctx         context.Context
-	brief       string
-	html        string
-	plan        PlanResult
-	summary     string
-	refineNote  string   // 非空表示迭代修改模式，值为修改指令
-	mode        string   // build | plan | research
-	attachIDs   []uint   // 本次任务携带的附件 ID
-	ev          PipelineEvents
+	a          *Agent
+	ctx        context.Context
+	brief      string
+	html       string
+	plan       PlanResult
+	summary    string
+	refineNote string // 非空表示迭代修改模式，值为修改指令
+	mode       string // build | plan | research
+	attachIDs  []uint // 本次任务携带的附件 ID
+	ev         PipelineEvents
+
+	// agent 加固状态
+	perm       *permGateway   // 工具权限网关
+	budget     *contextBudget // 上下文预算与压缩器
+	phase      string         // plan 模式两阶段门控：plan（只允许规划工具）→ act（全量工具）
+	research   string         // research 模式下子 Agent 产出的需求简报
+	writes     int            // write_file 成功写入次数（上限 2：首写 + 一次整体重写）
+	trackEdits bool           // 迭代修改模式：write 成功后进入编辑跟踪，强制后续用 edit_file 精准修改
 }
 
 func (rt *reactSession) stage(stage, msg string) {
@@ -44,16 +52,18 @@ func (rt *reactSession) detail(stage, msg, level string) {
 }
 
 // reactPrompt 构建 ReAct 系统提示词。refineTo 非空表示迭代修改模式。
-// mode：build 标准构建；plan 先出详细规划与交互说明再实施；research 先围绕需求做要点拆解再实施。
+// mode：build 标准构建；plan 两阶段规划先行；research 基于子 Agent 研究简报构建。
 func reactPrompt(brief, refineTo, mode string) string {
 	var sb strings.Builder
 	sb.WriteString(`你是 Atomix 平台的构建 Agent，通过「思考 → 调用工具 → 观察结果」的循环完成应用构建。
 
 可用工具：
 - plan_app：规划应用（应用名/模板/步骤），必须最先调用
-- write_file：写入完整单文件 HTML 应用（整个任务只允许成功写入一次）
+- commit_plan：规划模式下提交规划、解锁实施工具（仅规划模式可用）
+- write_file：写入完整单文件 HTML 应用（整个任务最多成功写入 2 次：首写 + 一次整体重写）
+- edit_file：对产物做精准片段替换（old_string 必须与产物唯一匹配），修复与小改动优先用编辑而不是重写
 - read_file：读取当前产物（迭代修改时先读后改）
-- run_checks：对产物执行静态校验（写入后必须调用）
+- run_checks：对产物执行静态校验，浏览器可用时还会实测运行时异常（写入后必须调用）
 - finish：校验通过后收尾
 
 硬性规则：
@@ -61,21 +71,23 @@ func reactPrompt(brief, refineTo, mode string) string {
 2. 数据用 localStorage 持久化（沙箱内不可用时平台会自动降级，无需担心）
 3. 禁止使用 document.cookie（沙箱环境会抛 SecurityError）
 4. 必须包含真实交互（事件绑定、DOM 更新），不能是静态页面
-5. run_checks 返回 issues 时必须修复并重新 write_file，直到校验通过才能 finish
+5. run_checks 返回 issues 时必须修复并重新提交产物，直到校验通过才能 finish；小问题优先用 edit_file 精准修复，整体性缺陷才 write_file 重写
 6. 每轮先用一两句话正文说明本轮思路（为什么这么做、下一步做什么），再发起工具调用；正文不要为空
 7. 不要空转：同一工具不要连续重复调用，除非按规则修复后重写`)
 	switch mode {
 	case "plan":
 		sb.WriteString(`
 
-本次为【规划模式】：plan_app 的 steps 需给出 4-6 条更细的构建步骤；写入产物前在正文里先给出应用的布局说明与关键交互清单（面向用户可读），再实施。`)
+本次为【规划模式】，分两个阶段执行：
+- 阶段一（当前）：工具层只有 plan_app 与 commit_plan。先调用 plan_app 产出构建计划（应用名/模板/4-6 条细化步骤），然后在正文给出面向用户的布局说明与关键交互清单，最后调用 commit_plan 提交规划并解锁实施工具。
+- 阶段二：全量工具解锁，严格按已提交的规划实施构建。`)
 	case "research":
 		sb.WriteString(`
 
-本次为【深度研究模式】：先用正文输出对该需求的要点拆解（目标用户、核心功能 3-5 条、信息结构、可能的边界情况），再进入规划与实施；write_file 的产物需体现拆解结论。`)
+本次为【深度研究模式】：研究子 Agent 已对需求做了要点拆解（目标用户、核心功能、信息结构、边界情况），简报将以用户消息注入。先阅读简报再规划实施；write_file 的产物需体现简报结论。`)
 	}
 	if refineTo != "" {
-		sb.WriteString("\n\n本次任务是在已有应用上做迭代修改。当前产物会通过 read_file 提供，按要求最小化修改后重新 write_file 完整文档。")
+		sb.WriteString("\n\n本次任务是在已有应用上做迭代修改。当前产物会通过 read_file 提供，优先用 edit_file 最小化修改；确需整体重构时才 write_file 完整文档。")
 	} else {
 		sb.WriteString("\n\n用户需求：" + brief)
 	}
@@ -88,10 +100,47 @@ func (rt *reactSession) reactLoop(ctx context.Context) error {
 	if rt.a.UseMock {
 		return rt.demoRun()
 	}
+	// research 模式：先委派研究子 Agent（独立上下文）拆解需求，产出简报注入主循环
+	if rt.mode == "research" {
+		rt.stage("plan", "研究子 Agent 正在拆解需求…")
+		brief := rt.a.researchBrief(ctx, rt.brief)
+		rt.research = brief
+		rt.detail("plan", "研究简报：\n"+truncateText(brief, 500), "info")
+	}
 	return rt.liveRun(ctx)
 }
 
-// liveRun 真实 LLM 的 ReAct 循环。
+// toolSpec 工具注册项：定义 + 激活条件（模式门控在工具层物理生效，而非仅靠提示词）。
+type toolSpec struct {
+	def    llm.Tool
+	active func(rt *reactSession) bool
+}
+
+// toolSpecs 全量工具注册表。
+func toolSpecs() []toolSpec {
+	return []toolSpec{
+		{def: planAppToolDef(), active: func(rt *reactSession) bool { return true }},
+		{def: commitPlanToolDef(), active: func(rt *reactSession) bool { return rt.phase == "plan" }},
+		{def: writeFileToolDef(), active: func(rt *reactSession) bool { return rt.phase != "plan" }},
+		{def: editFileToolDef(), active: func(rt *reactSession) bool { return rt.phase != "plan" }},
+		{def: readFileToolDef(), active: func(rt *reactSession) bool { return rt.phase != "plan" }},
+		{def: runChecksToolDef(), active: func(rt *reactSession) bool { return rt.phase != "plan" }},
+		{def: finishToolDef(), active: func(rt *reactSession) bool { return rt.phase != "plan" }},
+	}
+}
+
+// activeTools 按当前阶段返回可用工具定义。
+func (rt *reactSession) activeTools() []llm.Tool {
+	out := make([]llm.Tool, 0, len(toolSpecs()))
+	for _, s := range toolSpecs() {
+		if s.active(rt) {
+			out = append(out, s.def)
+		}
+	}
+	return out
+}
+
+// liveRun 真实 LLM 的 ReAct 循环：权限网关 + 上下文压缩 + 工具回喂闭环。
 func (rt *reactSession) liveRun(ctx context.Context) error {
 	messages := []llm.ChatMessage{
 		{Role: "system", Content: reactPrompt(rt.brief, rt.refineTo(), rt.mode)},
@@ -123,20 +172,27 @@ func (rt *reactSession) liveRun(ctx context.Context) error {
 		}
 		rt.detail("build", fmt.Sprintf("已注入 %d 个附件作为构建上下文", len(atts)), "info")
 	}
+	// 研究简报注入（research 模式）
+	if rt.research != "" {
+		messages = append(messages, llm.ChatMessage{Role: "user", Content: "【研究简报（研究子 Agent 产出）】\n" + rt.research})
+	}
 
-	tools := toolDefs()
+	loopCap := maxReActLoops
+	if rt.mode == "plan" {
+		loopCap += 4 // 规划模式两阶段，多给 4 轮预算
+	}
 	loops, repairs := 0, 0
 	for {
 		loops++
-		if loops > maxReActLoops {
+		if loops > loopCap {
 			if rt.html == "" {
-				return fmt.Errorf("ReAct 循环超过 %d 轮仍未产出可用产物", maxReActLoops)
+				return fmt.Errorf("ReAct 循环超过 %d 轮仍未产出可用产物", loopCap)
 			}
 			rt.detail("done", "达到轮数上限，以当前最优产物收尾", "warn")
 			break
 		}
 
-		resp, err := rt.a.LLM.ChatWithTools(ctx, messages, tools, reactTemperature, reactMaxTokens)
+		resp, err := rt.a.LLM.ChatWithTools(ctx, messages, rt.activeTools(), reactTemperature, reactMaxTokens)
 		if err != nil {
 			if rt.html != "" {
 				rt.detail("build", "模型调用失败，以已有产物收尾："+err.Error(), "warn")
@@ -157,7 +213,11 @@ func (rt *reactSession) liveRun(ctx context.Context) error {
 			}
 			// 循环还没产出任何东西就结束回答：强制拉回工具循环
 			messages = append(messages, llm.ChatMessage{Role: "assistant", Content: resp.Content})
-			messages = append(messages, llm.ChatMessage{Role: "user", Content: "请立即调用工具完成任务：先用 plan_app 规划，再用 write_file 写入完整 HTML。"})
+			pull := "请立即调用工具完成任务：先用 plan_app 规划，再用 write_file 写入完整 HTML。"
+			if rt.phase == "plan" {
+				pull = "请立即调用 plan_app 产出构建计划，然后调用 commit_plan 提交规划。"
+			}
+			messages = append(messages, llm.ChatMessage{Role: "user", Content: pull})
 			continue
 		}
 
@@ -165,6 +225,14 @@ func (rt *reactSession) liveRun(ctx context.Context) error {
 		messages = append(messages, llm.ChatMessage{Role: "assistant", Content: resp.Content, ToolCalls: resp.ToolCalls})
 		shouldStop := false
 		for _, tc := range resp.ToolCalls {
+			// 权限网关：ask 级工具先向用户推送确认卡片，拒绝/超时则拦截并把结果回喂模型
+			allowed, denyMsg := rt.perm.authorize(tc.Function.Name, permissionDetail(tc.Function.Name, tc.Function.Arguments), rt.ev)
+			if !allowed {
+				messages = append(messages, llm.ChatMessage{Role: "tool", Content: denyMsg, ToolCallID: tc.ID})
+				rt.detail("observe", fmt.Sprintf("[%s] 权限拦截：%s", tc.Function.Name, truncateText(denyMsg, 120)), "warn")
+				continue
+			}
+
 			result := rt.runTool(tc.Function.Name, tc.Function.Arguments)
 
 			// 行动事件（前端展示）
@@ -192,12 +260,16 @@ func (rt *reactSession) liveRun(ctx context.Context) error {
 
 			messages = append(messages, llm.ChatMessage{
 				Role:       "tool",
-				Content:    result.Observe,
+				Content:    clampObserve(result.Observe), // 单条观察限长，防污染上下文
 				ToolCallID: tc.ID,
 			})
 		}
 		if shouldStop {
 			break
+		}
+		// 上下文压缩：超预算时把中间历史压成状态摘要（保留 system/需求/最近消息）
+		if rt.budget.maybeCompress(&messages) {
+			rt.detail("build", "上下文接近预算，已自动压缩历史消息为状态摘要", "info")
 		}
 	}
 	return nil
@@ -211,7 +283,7 @@ func (rt *reactSession) act(tool, argsJSON string) {
 	rt.detail("act", fmt.Sprintf("调用 %s → %s", tool, toolActionText(tool, argsJSON)), "info")
 }
 
-// demoRun 演示模式的脚本化 ReAct 轨迹：与真实循环同构（plan → write → checks(失败) → 修复重写 → checks(通过) → finish），
+// demoRun 演示模式的脚本化 ReAct 轨迹：与真实循环同构（plan → write → checks(失败) → edit_file 精准修复 → checks(通过) → finish），
 // 工具全部真实执行，让评审者无 Key 也能观察到完整的 think→act→observe 闭环。
 func (rt *reactSession) demoRun() error {
 	rt.stage("plan", "Agent 正在理解需求并制定构建计划…")
@@ -243,14 +315,18 @@ func (rt *reactSession) demoRun() error {
 	rt.observe("run_checks", checkRes)
 
 	if !checkRes.OK {
-		rt.detail("think", "校验发现沙箱兼容性问题：document.cookie 在 opaque origin 下抛 SecurityError。定位后移除该调用，重新写入", "warn")
-		// 真实修复：移除注入的问题代码
-		fixed := strings.Replace(rt.html, "<script>document.cookie='demo=1';</script>\n", "", 1)
-		fixed = strings.Replace(fixed, "<script>document.cookie='demo=1';</script>", "", 1)
-		rewriteJSON := mustJSON(writeArgs{Path: "index.html", Content: fixed})
-		rt.act("write_file", rewriteJSON)
-		rewriteRes := rt.runTool("write_file", rewriteJSON)
-		rt.observe("write_file", rewriteRes)
+		rt.detail("think", "校验发现沙箱兼容性问题：document.cookie 在 opaque origin 下抛 SecurityError。用 edit_file 精准移除该片段，不重写全文", "warn")
+		// 真实修复：edit_file 精准替换（演示行级编辑能力）
+		editJSON := mustJSON(editArgs{
+			OldString: "<script>document.cookie='demo=1';</script>\n",
+			NewString: "",
+		})
+		if !strings.Contains(rt.html, "<script>document.cookie='demo=1';</script>\n") {
+			editJSON = mustJSON(editArgs{OldString: "<script>document.cookie='demo=1';</script>", NewString: ""})
+		}
+		rt.act("edit_file", editJSON)
+		editRes := rt.runTool("edit_file", editJSON)
+		rt.observe("edit_file", editRes)
 
 		rt.detail("think", "修复完成，重新校验全部检查项", "info")
 		rt.act("run_checks", "{}")
@@ -284,10 +360,17 @@ func toolActionText(name, argsJSON string) string {
 		if err := json.Unmarshal([]byte(argsJSON), &a); err == nil {
 			return fmt.Sprintf("选定模板 %s", a.Template)
 		}
+	case "commit_plan":
+		return "提交规划，解锁实施工具"
 	case "write_file":
 		var a writeArgs
 		if err := json.Unmarshal([]byte(argsJSON), &a); err == nil {
 			return fmt.Sprintf("写入 %s（%d 字符）", a.Path, len(a.Content))
+		}
+	case "edit_file":
+		var a editArgs
+		if err := json.Unmarshal([]byte(argsJSON), &a); err == nil {
+			return fmt.Sprintf("精准修改 index.html（替换 %d 字符片段）", len(a.OldString))
 		}
 	case "read_file":
 		return "读取当前产物"
@@ -297,6 +380,23 @@ func toolActionText(name, argsJSON string) string {
 		return "收尾汇总"
 	}
 	return ""
+}
+
+// permissionDetail 生成权限确认卡片上展示的操作详情。
+func permissionDetail(name, argsJSON string) string {
+	switch name {
+	case "write_file":
+		var a writeArgs
+		if err := json.Unmarshal([]byte(argsJSON), &a); err == nil {
+			return fmt.Sprintf("向 %s 写入完整应用（%d 字符），将覆盖当前产物", a.Path, len(a.Content))
+		}
+	case "edit_file":
+		var a editArgs
+		if err := json.Unmarshal([]byte(argsJSON), &a); err == nil {
+			return fmt.Sprintf("替换产物片段：%s → %s", truncateText(a.OldString, 60), truncateText(a.NewString, 60))
+		}
+	}
+	return "Agent 请求调用工具 " + name
 }
 
 func truncateText(s string, n int) string {
@@ -318,7 +418,14 @@ func mustJSON(v interface{}) string {
 // Run 执行完整构建任务：先落库项目行（生成中状态可见），再跑 ReAct 循环，完成后回填产物。
 // mode: build | plan | research；attachmentIDs: 随任务携带的附件。
 func (a *Agent) Run(ctx context.Context, userID uint, brief, mode string, attachmentIDs []uint, ev PipelineEvents) (*store.Project, error) {
-	rt := &reactSession{a: a, ctx: ctx, brief: brief, mode: mode, attachIDs: attachmentIDs, ev: ev}
+	rt := &reactSession{
+		a: a, ctx: ctx, brief: brief, mode: mode, attachIDs: attachmentIDs, ev: ev,
+		perm: newPermGateway(a.PermRegistry), budget: newContextBudget(),
+		phase: "act",
+	}
+	if mode == "plan" {
+		rt.phase = "plan" // 规划模式从规划阶段起步：实施工具在工具层物理不可见
+	}
 	return rt.runProject(ctx, userID, brief, "")
 }
 
@@ -328,7 +435,11 @@ func (a *Agent) Refine(ctx context.Context, userID, projectID uint, instruction 
 	if err := store.DB.Where("id = ? AND user_id = ?", projectID, userID).First(&p).Error; err != nil {
 		return nil, fmt.Errorf("项目不存在")
 	}
-	rt := &reactSession{a: a, ctx: ctx, brief: instruction, html: p.HTML, attachIDs: attachmentIDs, ev: ev}
+	rt := &reactSession{
+		a: a, ctx: ctx, brief: instruction, html: p.HTML, attachIDs: attachmentIDs, ev: ev,
+		perm: newPermGateway(a.PermRegistry), budget: newContextBudget(),
+		phase: "act", trackEdits: true,
+	}
 	rt.refineNote = instruction
 	return rt.runProject(ctx, userID, instruction, p.Name)
 }
@@ -367,6 +478,13 @@ func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, exis
 		rt.ev.OnDetail = func(stage, message, level string) {
 			userDetail(stage, message, level)
 			store.DB.Create(&store.Event{ProjectID: project.ID, Stage: stage, Message: message, Level: level, TsMs: store.Now()})
+		}
+	}
+	if rt.ev.OnPermission != nil {
+		userPerm := rt.ev.OnPermission
+		rt.ev.OnPermission = func(reqID, tool, detail string) {
+			userPerm(reqID, tool, detail)
+			store.DB.Create(&store.Event{ProjectID: project.ID, Stage: "act", Message: "权限确认请求 [" + tool + "]：" + detail, Level: "warn", TsMs: store.Now()})
 		}
 	}
 

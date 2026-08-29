@@ -38,7 +38,7 @@ func main() {
 		llmSvc = llm.NewDeepSeek(llm.Options{APIKey: "unused"})
 	}
 
-	ag := &agent.Agent{LLM: llmSvc, UseMock: cfg.UseMock}
+	ag := agent.NewAgent(llmSvc, cfg.UseMock)
 	h := &api.Handlers{Cfg: cfg, Agent: ag}
 	api.Register(r, h)
 

@@ -14,12 +14,21 @@ type Agent struct {
 	LLM           llm.Service
 	UseMock       bool
 	CurrentUserID uint // 最近一次请求的用户 ID，用于附件归属校验
+	// PermRegistry 跨任务权限确认注册表：HTTP 确认接口按请求 ID 回填用户决定
+	PermRegistry *PermRegistry
+}
+
+// NewAgent 构造带默认组件的 Agent（权限注册表必初始化）。
+func NewAgent(svc llm.Service, useMock bool) *Agent {
+	return &Agent{LLM: svc, UseMock: useMock, PermRegistry: NewPermRegistry()}
 }
 
 // PipelineEvents 流水线事件回调。
 type PipelineEvents struct {
 	OnStage  func(stage, message string)
 	OnDetail func(stage, message, level string)
+	// OnPermission 权限确认请求：reqID 用于回填用户决定，tool/detail 用于展示确认卡片
+	OnPermission func(reqID, tool, detail string)
 }
 
 // makePlan 旧版独立规划（保留给规划回退与单测使用；主流程由 ReAct 循环内的 plan_app 工具承担）。
