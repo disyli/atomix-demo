@@ -292,3 +292,46 @@ const shimScript = `
 })();
 </script>
 `
+
+// generateSSE 以 SSE 流式推送一次完整生成流水线的进度。
+func (h *Handlers) generateSSE(c *gin.Context) {
+	uid := middleware.UID(c)
+	brief := c.Query("brief")
+	if brief == "" {
+		c.String(http.StatusBadRequest, "brief required")
+		return
+	}
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.String(http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+
+	send := func(event, data string) {
+		c.SSEvent(event, data)
+		flusher.Flush()
+	}
+
+	project, err := h.Agent.Run(c.Request.Context(), uid, brief, agent.PipelineEvents{
+		OnStage: func(stage, message string) {
+			send("stage", stage+"\x1f"+message)
+		},
+		OnDetail: func(stage, message, level string) {
+			send("detail", stage+"\x1f"+message+"\x1f"+level)
+		},
+	})
+	if err != nil {
+		send("error", "生成失败: "+err.Error())
+		return
+	}
+	// 重新加载完整事件历史
+	var es []store.Event
+	store.DB.Where("project_id = ?", project.ID).Order("id ASC").Find(&es)
+	payload := gin.H{"project": projectBrief(*project)}
+	c.SSEvent("done", toJSON(payload))
+}
