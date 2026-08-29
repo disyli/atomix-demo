@@ -4,6 +4,8 @@
 
 > 本项目为 ROOT 团队 Atoms-Demo 笔试作品。
 
+📖 [架构文档（含架构图 / 时序图 / API 清单）](docs/ARCHITECTURE.md)
+
 ## 功能
 
 - 注册 / 登录（JWT + bcrypt，密码哈希存储）
