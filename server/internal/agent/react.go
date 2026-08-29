@@ -107,8 +107,9 @@ func (rt *reactSession) liveRun(ctx context.Context) error {
 			return fmt.Errorf("模型调用失败: %w", err)
 		}
 
+		// 思考事件：每轮模型回复文本（若有）展示一次
 		if resp.Content != "" {
-			rt.detail("build", truncateText(resp.Content, 160), "info")
+			rt.detail("think", truncateText(resp.Content, 200), "info")
 		}
 
 		// 模型直接给出最终回答（未调用工具）
@@ -135,10 +136,8 @@ func (rt *reactSession) liveRun(ctx context.Context) error {
 			}
 			rt.detail("act", fmt.Sprintf("调用 %s → %s", tc.Function.Name, think), "info")
 
-			// 思考事件
-			if resp.Content != "" {
-				rt.detail("think", truncateText(resp.Content, 200), "info")
-			}
+			// 观察事件：工具真实执行结果同步展示到时间线（与回喂模型的文本一致）
+			rt.observe(tc.Function.Name, result)
 
 			if tc.Function.Name == "run_checks" && !result.OK {
 				repairs++
