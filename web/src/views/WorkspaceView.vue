@@ -104,6 +104,15 @@ async function init() {
     serverMode.value = health.mode === 'live' ? 'DeepSeek 已接入' : '演示模式'
   } catch { serverMode.value = '' }
   loadProjects()
+  // 刷新后自动恢复上次活跃项目的完整对话（数据持久化）
+  try {
+    const lastPid = sessionStorage.getItem('atomix_last_project')
+    if (lastPid) {
+      sessionStorage.removeItem('atomix_last_project')
+      const p = await api.getProject(lastPid)
+      if (p && p.id) openProject(p)
+    }
+  } catch {}
   // 接收首页 Dashboard 传来的待处理任务
   try {
     const raw = sessionStorage.getItem('atomix_pending')
@@ -282,7 +291,7 @@ async function classify(text, attachIds = [], m = 'build') {
   const resp = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (localStorage.getItem('atomix_token') || '') },
-    body: JSON.stringify({ message: text, attachmentIds: attachIds, mode: m })
+    body: JSON.stringify({ message: text, attachmentIds: attachIds, mode: m, projectId: activeProject.value?.id || 0 })
   })
   if (!resp.ok) throw new Error('意图识别失败 (' + resp.status + ')')
   return resp.json()
@@ -505,33 +514,65 @@ function setActiveProject(p) {
   activeProject.value = p
   previewUrl.value = api.previewUrl(p.id, readAppData(p.id))
   rightTab.value = 'preview'
+  try { sessionStorage.setItem('atomix_last_project', String(p.id)) } catch {}
 }
 
-/* 打开历史项目：用 brief + 事件流还原该项目的对话 */
+/* 打开历史项目：从 Message 表还原该项目的完整多轮对话（每轮用户输入 + 助手回复/构建回合） */
 async function openProject(p) {
   if (running.value) return
   setActiveProject(p)
+  let messages = []
   let events = []
+  try { messages = await api.getMessages(p.id) } catch {}
   try { events = await api.getEvents(p.id) } catch {}
-  thread.value = [newUserMsg(p.brief)]
-  const run = reactive(newRunMsg(p.brief))
-  run.status = 'done'
-  run.projectId = p.id
-  run.projectName = p.name
-  let seenStage = ''
-  for (const ev of events) {
-    if (ev.level === 'stage') {
-      if (seenStage) run.stageState[seenStage] = 'done'
-      seenStage = ev.stage
-      run.stageState[ev.stage] = 'done'
-      run.currentStage = ''
-    }
-    run.events.push({ stage: ev.stage, message: ev.message, level: ev.level, ts: ev.ts })
+  if (!messages.length) {
+    // 旧数据兜底：无 Message 记录时按事件流还原单轮构建
+    messages = [{ id: 0, role: 'user', kind: 'text', text: p.brief, createdAt: p.createdAt }]
   }
-  if (seenStage) run.stageState[seenStage] = 'done'
-  const lastDone = [...events].reverse().find(e => e.stage === 'done')
-  run.summary = lastDone ? lastDone.message : '构建完成，预览已就绪'
-  thread.value.push(run)
+  // 事件按 id 升序分组：每轮 run 回合对应一段事件流，事件在每轮开始（stage=plan）处切开
+  const runs = []
+  let cur = null
+  for (const ev of events) {
+    if (ev.level === 'stage' && ev.stage === 'plan') {
+      if (cur) runs.push(cur)
+      cur = { events: [], seenStage: '' }
+    }
+    if (!cur) cur = { events: [], seenStage: '' }
+    cur.events.push(ev)
+  }
+  if (cur) runs.push(cur)
+
+  thread.value = []
+  let runIdx = 0
+  for (const m of messages) {
+    if (m.role === 'user') {
+      thread.value.push({ id: 'h-u-' + m.id, role: 'user', text: m.text, ts: m.createdAt })
+    } else if (m.kind === 'text') {
+      thread.value.push({ id: 'h-t-' + m.id, role: 'assistant', kind: 'chat', text: m.text, status: 'chat', ts: m.createdAt })
+    } else if (m.kind === 'run') {
+      const run = reactive(newRunMsg(m.text))
+      run.id = 'h-r-' + m.id
+      run.status = m.status || 'done'
+      run.projectId = p.id
+      run.projectName = p.name
+      // 对应段落的事件流还原（若事件条数足够）
+      const seg = runs[runIdx] || { events: [], seenStage: '' }
+      runIdx++
+      for (const ev of seg.events) {
+        if (ev.level === 'stage') {
+          if (seg.seenStage) run.stageState[seg.seenStage] = 'done'
+          seg.seenStage = ev.stage
+          run.stageState[ev.stage] = 'done'
+          run.currentStage = ''
+        }
+        run.events.push({ stage: ev.stage, message: ev.message, level: ev.level, ts: ev.ts })
+      }
+      if (seg.seenStage) run.stageState[seg.seenStage] = 'done'
+      const lastDone = [...seg.events].reverse().find(e => e.stage === 'done')
+      run.summary = lastDone ? lastDone.message : (run.status === 'done' ? '构建完成，预览已就绪' : '')
+      thread.value.push(run)
+    }
+  }
   scrollToBottom()
 }
 
@@ -543,6 +584,7 @@ function newChat() {
   previewUrl.value = ''
   rightTab.value = 'preview'
   composer.value = ''
+  try { sessionStorage.removeItem('atomix_last_project') } catch {}
 }
 
 const composerPlaceholder = computed(() =>

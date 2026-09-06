@@ -24,6 +24,8 @@ export const api = {
   listProjects: () => request('/api/projects'),
   getProject: (id) => request('/api/projects/' + id),
   getEvents: (id) => request('/api/projects/' + id + '/events'),
+  // 同一 project 的完整对话历史（每轮 user/assistant 消息），刷新/回看时还原对话
+  getMessages: (id) => request('/api/projects/' + id + '/messages'),
   // 迭代修改：在已有项目上追加自然语言修改指令（后端走 ReAct 循环）
   refine: (id, instruction) => request('/api/projects/' + id + '/refine', { method: 'POST', body: JSON.stringify({ instruction }) }),
   // 预览接口由 iframe 直接加载，无法携带 Authorization 头，

@@ -38,6 +38,7 @@ type reactSession struct {
 	research   string         // research 模式下子 Agent 产出的需求简报
 	writes     int            // write_file 成功写入次数（上限 2：首写 + 一次整体重写）
 	trackEdits bool           // 迭代修改模式：write 成功后进入编辑跟踪，强制后续用 edit_file 精准修改
+	existing   *store.Project // 迭代修改模式：复用的已有项目行，不新建 project
 }
 
 func (rt *reactSession) stage(stage, msg string) {
@@ -493,6 +494,7 @@ func (a *Agent) Run(ctx context.Context, userID uint, brief, mode string, attach
 }
 
 // Refine 在已有项目上执行迭代修改：读取旧产物 → ReAct 循环修改 → 回填。
+// 同一 project 的每一轮修改都保存为新的对话轮次（Message 表），项目行本身复用不新建。
 func (a *Agent) Refine(ctx context.Context, userID, projectID uint, instruction string, attachmentIDs []uint, ev PipelineEvents) (*store.Project, error) {
 	var p store.Project
 	if err := store.DB.Where("id = ? AND user_id = ?", projectID, userID).First(&p).Error; err != nil {
@@ -501,31 +503,40 @@ func (a *Agent) Refine(ctx context.Context, userID, projectID uint, instruction 
 	rt := &reactSession{
 		a: a, ctx: ctx, brief: instruction, html: p.HTML, attachIDs: attachmentIDs, ev: ev,
 		perm: newPermGateway(a.PermRegistry), budget: newContextBudget(),
-		phase: "act", trackEdits: true,
+		phase: "act", trackEdits: true, existing: &p,
 	}
 	rt.refineNote = instruction
 	return rt.runProject(ctx, userID, instruction, p.Name)
 }
 
-// runProject 通用执行壳：建项目行 → ReAct 循环 → 回填产物与状态。
-// 项目行先落库修复了旧流水线"事件挂在旧项目 / 生成中不可见"的问题。
+// runProject 通用执行壳：建项目行（或复用已有行）→ ReAct 循环 → 回填产物与状态。
+// 新构建时项目行先落库修复了旧流水线"事件挂在旧项目 / 生成中不可见"的问题；
+// 迭代修改时（existing 非空）复用同一项目行，事件与产物更新都落在该项目上。
 func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, existingName string) (*store.Project, error) {
 	now := store.Now()
-	name := existingName
-	if name == "" {
-		name = defaultNameFor(rt.a, brief)
-	}
-	project := &store.Project{
-		UserID:      userID,
-		Name:        name,
-		Brief:       brief,
-		Template:    "pending",
-		Status:      "generating",
-		CreatedAtMs: now,
-		UpdatedAtMs: now,
-	}
-	if err := store.DB.Create(project).Error; err != nil {
-		return nil, err
+	project := rt.existing
+	if project == nil {
+		name := existingName
+		if name == "" {
+			name = defaultNameFor(rt.a, brief)
+		}
+		project = &store.Project{
+			UserID:      userID,
+			Name:        name,
+			Brief:       brief,
+			Template:    "pending",
+			Status:      "generating",
+			CreatedAtMs: now,
+			UpdatedAtMs: now,
+		}
+		if err := store.DB.Create(project).Error; err != nil {
+			return nil, err
+		}
+	} else {
+		// 复用已有项目行：状态回到 generating，展示"本轮修改进行中"
+		project.Status = "generating"
+		project.UpdatedAtMs = now
+		store.DB.Model(project).Updates(map[string]interface{}{"status": "generating", "updated_at_ms": project.UpdatedAtMs})
 	}
 
 	// 事件实时落库：SSE 推送的同时写入 Event 表，历史回看可完整回放 ReAct 轨迹
@@ -569,14 +580,16 @@ func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, exis
 		return nil, err
 	}
 
-	// 模板与名称回填
-	if rt.plan.Template != "" {
-		project.Template = rt.plan.Template
-	} else {
-		project.Template = Match(brief)
-	}
-	if existingName == "" && rt.plan.AppName != "" {
-		project.Name = rt.plan.AppName
+	// 模板与名称回填（复用已有项目时保留原值）
+	if rt.existing == nil {
+		if rt.plan.Template != "" {
+			project.Template = rt.plan.Template
+		} else {
+			project.Template = Match(brief)
+		}
+		if existingName == "" && rt.plan.AppName != "" {
+			project.Name = rt.plan.AppName
+		}
 	}
 	project.HTML = rt.html
 	project.Status = "ready"
@@ -590,16 +603,33 @@ func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, exis
 
 	if rt.summary != "" {
 		rt.appendEvent(project.ID, "done", rt.summary, "info")
+	} else if rt.existing != nil {
+		rt.appendEvent(project.ID, "done", "修改完成，预览已更新", "info")
 	} else {
 		rt.appendEvent(project.ID, "done", "构建完成，预览已就绪", "info")
 	}
-	rt.stage("done", "构建完成，预览已就绪 🎉")
+	if rt.existing != nil {
+		rt.stage("done", "修改完成，预览已更新 🎉")
+	} else {
+		rt.stage("done", "构建完成，预览已就绪 🎉")
+	}
 	return project, nil
 }
 
 // appendEvent 写入一条项目事件。
 func (rt *reactSession) appendEvent(projectID uint, stage, message, level string) {
 	store.DB.Create(&store.Event{ProjectID: projectID, Stage: stage, Message: message, Level: level, TsMs: store.Now()})
+}
+
+// AppendUserMessage 对话消息落库：用户一轮输入（构建需求或修改指令）。
+func AppendUserMessage(projectID, userID uint, text string) {
+	store.DB.Create(&store.Message{ProjectID: projectID, UserID: userID, Role: "user", Kind: "text", Text: text, CreatedAtMs: store.Now()})
+}
+
+// AppendRunMessage 对话消息落库：助手一轮构建/修改回合的终态记录。
+// status：done / failed / stopped；text 为该轮的用户输入（回看时与用户消息成对还原）。
+func AppendRunMessage(projectID uint, text string, userID uint, status string) {
+	store.DB.Create(&store.Message{ProjectID: projectID, UserID: userID, Role: "assistant", Kind: "run", Text: text, Status: status, CreatedAtMs: store.Now()})
 }
 
 // defaultNameFor 在 ReAct 循环开始前用规则引擎预估应用名（循环内 plan_app 会覆盖）。

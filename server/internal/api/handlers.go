@@ -42,6 +42,7 @@ func Register(r *gin.Engine, h *Handlers) {
 	authed.POST("/projects", h.createProject)
 	authed.GET("/projects/:id", h.getProject)
 	authed.GET("/projects/:id/events", h.getEvents)
+	authed.GET("/projects/:id/messages", h.getProjectMessages)
 	authed.GET("/projects/:id/preview", h.previewHTML)
 	authed.GET("/generate", h.generateSSE)
 	authed.POST("/projects/:id/refine", h.refineSSE)
@@ -293,6 +294,21 @@ func (h *Handlers) getEvents(c *gin.Context) {
 	c.JSON(http.StatusOK, es)
 }
 
+// getProjectMessages 返回同一 project 的完整对话历史（每轮 user/assistant 消息按时间序）。
+func (h *Handlers) getProjectMessages(c *gin.Context) {
+	var p store.Project
+	if err := store.DB.Where("id = ? AND user_id = ?", c.Param("id"), middleware.UID(c)).First(&p).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "项目不存在"})
+		return
+	}
+	var ms []store.Message
+	store.DB.Where("project_id = ?", p.ID).Order("id ASC").Find(&ms)
+	if ms == nil {
+		ms = []store.Message{}
+	}
+	c.JSON(http.StatusOK, ms)
+}
+
 // previewHTML 以独立文档形式返回生成的应用（供 iframe srcdoc/src 使用）。
 // 沙箱 iframe 无 allow-same-origin 时产物访问 localStorage 会抛 SecurityError，
 // 这里在 <head> 前注入存储垫片：探测失败则以内存存储降级并通知父页面。
@@ -307,18 +323,38 @@ func (h *Handlers) previewHTML(c *gin.Context) {
 
 // chatIntent 对用户消息做意图识别：chat 闲聊回复 / clarify 澄清 / build 构建。
 // 前端据此决定展示聊天回复还是进入构建流程。可携带附件 ID（图片走多模态识图）。
+// 对话消息持久化：用户消息与 chat/clarify 回复均落 Message 表（projectId 可为 0 表示暂无项目）。
 func (h *Handlers) chatIntent(c *gin.Context) {
 	var req struct {
 		Message       string `json:"message"`
 		AttachmentIDs []uint `json:"attachmentIds"`
 		Mode          string `json:"mode"`
+		ProjectID     uint   `json:"projectId"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Message) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "消息不能为空"})
 		return
 	}
-	h.Agent.CurrentUserID = middleware.UID(c)
+	uid := middleware.UID(c)
+	// 归属校验：projectId 必须属于当前用户
+	if req.ProjectID > 0 {
+		var cnt int64
+		store.DB.Model(&store.Project{}).Where("id = ? AND user_id = ?", req.ProjectID, uid).Count(&cnt)
+		if cnt == 0 {
+			req.ProjectID = 0
+		}
+	}
+	h.Agent.CurrentUserID = uid
 	r := h.Agent.ClassifyIntent(c.Request.Context(), req.Message, req.AttachmentIDs)
+	// 落库：用户消息 + 助手回复（chat/clarify 时）
+	if req.ProjectID > 0 {
+		store.DB.Create(&store.Message{ProjectID: req.ProjectID, UserID: uid, Role: "user", Kind: "text", Text: req.Message, CreatedAtMs: store.Now()})
+	}
+	if r.Intent == "chat" || r.Intent == "clarify" {
+		if req.ProjectID > 0 {
+			store.DB.Create(&store.Message{ProjectID: req.ProjectID, UserID: uid, Role: "assistant", Kind: "text", Text: r.Reply, CreatedAtMs: store.Now()})
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{"intent": r.Intent, "reply": r.Reply, "brief": r.Brief})
 }
 
@@ -378,14 +414,19 @@ func (h *Handlers) generateSSE(c *gin.Context) {
 	})
 	if errors.Is(err, agent.ErrCanceled) {
 		// 用户主动停止：发 runId 供前端定位 + stopped 终态事件（非 error）
+		agent.AppendRunMessage(uid, brief, 0, "stopped")
 		send("runId", runID)
 		send("stopped", "已按用户要求停止构建")
 		return
 	}
 	if err != nil {
+		agent.AppendRunMessage(uid, brief, 0, "failed")
 		send("error", "生成失败: "+err.Error())
 		return
 	}
+	// 对话消息持久化：首轮构建的用户消息 + 助手构建回合（done 终态）
+	agent.AppendUserMessage(project.ID, uid, brief)
+	agent.AppendRunMessage(project.ID, brief, uid, "done")
 	// 重新加载完整事件历史
 	var es []store.Event
 	store.DB.Where("project_id = ?", project.ID).Order("id ASC").Find(&es)
@@ -441,13 +482,21 @@ func (h *Handlers) refineSSE(c *gin.Context) {
 		},
 	})
 	if errors.Is(err, agent.ErrCanceled) {
+		// 每轮修改的用户指令 + stopped 回合消息（同 project 保存为新对话轮次）
+		agent.AppendUserMessage(p.ID, uid, req.Instruction)
+		agent.AppendRunMessage(p.ID, req.Instruction, uid, "stopped")
 		send("runId", runID)
 		send("stopped", "已按用户要求停止构建")
 		return
 	}
 	if err != nil {
+		agent.AppendUserMessage(p.ID, uid, req.Instruction)
+		agent.AppendRunMessage(p.ID, req.Instruction, uid, "failed")
 		send("error", "修改失败: "+err.Error())
 		return
 	}
+	// 每轮修改的用户指令 + done 回合消息：同一 project 的每一轮对话都保存为新记录
+	agent.AppendUserMessage(p.ID, uid, req.Instruction)
+	agent.AppendRunMessage(p.ID, req.Instruction, uid, "done")
 	send("done", toJSON(gin.H{"project": projectBrief(*updated), "runId": runID}))
 }
