@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, computed, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, nextTick, watch, onMounted, onBeforeUnmount } from 'vue'
 import { api } from '../api'
 
 /* ---------- 用户 ---------- */
@@ -17,6 +17,7 @@ const projects = ref([])
 const activeProject = ref(null)
 const previewUrl = ref('')
 const rightTab = ref('preview')
+const codeView = ref({ loading: false, name: '', filename: '', source: '', lines: 0, size: 0, copied: false })
 const serverMode = ref('')
 const chatBox = ref(null)
 const composer = ref('')
@@ -466,6 +467,8 @@ async function refineSend(text, alreadyRouted, attachIds = []) {
             run.projectId = d.project.id
             run.projectName = d.project.name
             setActiveProject(d.project)
+            // 迭代完成：若用户正开着源代码面板，立即拉取新版本源码
+            if (rightTab.value === 'code') loadSource()
           } catch {}
         } else if (ev === 'error') {
           run.errorText = data
@@ -514,8 +517,60 @@ function setActiveProject(p) {
   activeProject.value = p
   previewUrl.value = api.previewUrl(p.id, readAppData(p.id))
   rightTab.value = 'preview'
+  codeView.value = { loading: false, name: '', filename: '', source: '', lines: 0, size: 0, copied: false }
   try { sessionStorage.setItem('atomix_last_project', String(p.id)) } catch {}
 }
+
+/* 代码展示区：加载当前项目生成应用的源码（构建/每轮迭代后刷新） */
+async function loadSource() {
+  if (!activeProject.value) return
+  codeView.value.loading = true
+  try {
+    const s = await api.getSource(activeProject.value.id)
+    codeView.value = { loading: false, name: s.name, filename: s.filename, source: s.source, lines: s.lines, size: s.size, copied: false }
+  } catch (e) {
+    codeView.value = { loading: false, name: '', filename: '', source: '', lines: 0, size: 0, copied: false }
+  }
+}
+
+// 首次切到「源代码」tab 时懒加载源码（此后构建/迭代完成会重置 codeView，再切会重新拉取）
+watch(rightTab, (v) => { if (v === 'code' && !codeView.value.source && activeProject.value && !codeView.value.loading) loadSource() })
+
+async function copySource() {
+  if (!codeView.value.source) return
+  try {
+    await navigator.clipboard.writeText(codeView.value.source)
+    codeView.value.copied = true
+    setTimeout(() => { codeView.value.copied = false }, 1600)
+  } catch {}
+}
+
+/* 轻量 HTML 语法高亮：先整体转义，再按 token 分组着色（标签/属性名/属性值/注释/文本）。
+   与后端零依赖，前端 ~40 行实现，配色走纸感变量。 */
+function highlightHTML(src) {
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const safe = esc(src)
+  return safe
+    // 注释
+    .replace(/(&lt;!--[\s\S]*?--&gt;)/g, '<span class="tok-cmt">$1</span>')
+    // 标签整体：&lt;div ...&gt;（先中性包裹，再细分属性）
+    .replace(/(&lt;\/?)([a-zA-Z][\w-]*)([\s\S]*?)(\/?&gt;)/g, (m, open, tag, attrs, close) => {
+      const attrHtml = attrs
+        // 属性值（单双引号）
+        .replace(/(\s)([\w-]+)(=)(&quot;.*?&quot;|&#39;.*?&#39;|"[^"]*"|'[^']*')/g,
+          '$1<span class="tok-attr">$2</span>$3<span class="tok-str">$4</span>')
+        .replace(/(\s)([\w-]+)(?=[\s/])/g, '$1<span class="tok-attr">$2</span>')
+      return '<span class="tok-pun">' + open + '</span><span class="tok-tag">' + tag + '</span>' + attrHtml + '<span class="tok-pun">' + close + '</span>'
+    })
+    // &lt;script&gt; / &lt;style&gt; 内部代码：等宽纯色（脚本内容不再细分着色，避免正则误伤）
+}
+
+/* 代码面板行号：源码行数数组，供模板渲染行号列 */
+const codeLines = computed(() => codeView.value.source ? codeView.value.source.split('\n') : [])
+const codeSizeText = computed(() => {
+  const kb = codeView.value.size / 1024
+  return kb >= 1024 ? (kb / 1024).toFixed(1) + ' MB' : kb.toFixed(1) + ' KB'
+})
 
 /* 打开历史项目：从 Message 表还原该项目的完整多轮对话（每轮用户输入 + 助手回复/构建回合） */
 async function openProject(p) {
@@ -583,6 +638,7 @@ function newChat() {
   activeProject.value = null
   previewUrl.value = ''
   rightTab.value = 'preview'
+  codeView.value = { loading: false, name: '', filename: '', source: '', lines: 0, size: 0, copied: false }
   composer.value = ''
   try { sessionStorage.removeItem('atomix_last_project') } catch {}
 }
@@ -810,6 +866,7 @@ onBeforeUnmount(() => {
       <section class="right">
         <div class="tabs">
           <button :class="{ active: rightTab === 'preview' }" @click="rightTab = 'preview'">应用预览</button>
+          <button :class="{ active: rightTab === 'code' }" @click="rightTab = 'code'">源代码</button>
           <button :class="{ active: rightTab === 'history' }" @click="rightTab = 'history'">
             历史项目 <span class="count">{{ projects.length }}</span>
           </button>
@@ -833,6 +890,37 @@ onBeforeUnmount(() => {
               sandbox="allow-scripts allow-forms allow-modals"
               class="preview-frame"
             ></iframe>
+          </template>
+        </div>
+
+        <div v-show="rightTab === 'code'" class="code-wrap">
+          <div v-if="!activeProject" class="empty-tip big bp-grid">
+            <div class="big-mono">// no source yet</div>
+            还没有可查看的源代码
+            <span>生成应用后，这里会展示完整 HTML 源码</span>
+          </div>
+          <template v-else>
+            <div class="code-head">
+              <b class="code-fname">{{ codeView.filename || 'app.html' }}</b>
+              <span class="meta">{{ codeView.lines }} 行 · {{ codeSizeText }}</span>
+              <span class="flex-spacer"></span>
+              <button class="code-act" :disabled="!codeView.source" @click="copySource">
+                {{ codeView.copied ? '已复制 ✓' : '复制' }}
+              </button>
+              <a
+                v-if="codeView.source"
+                class="code-act"
+                :href="api.sourceDownloadUrl(activeProject.id)"
+                :download="codeView.filename || 'app.html'"
+              >下载</a>
+              <button class="code-act" :disabled="codeView.loading" @click="loadSource">刷新</button>
+            </div>
+            <div v-if="codeView.loading" class="code-loading">正在读取源码…</div>
+            <div v-else-if="!codeView.source" class="code-loading">该项目还没有生成源码（可能构建未完成）</div>
+            <div v-else class="code-body">
+              <div class="code-gutter">{{ codeLines.map((_, i) => i + 1).join('\n') }}</div>
+              <pre class="code-pre"><code v-html="highlightHTML(codeView.source)"></code></pre>
+            </div>
           </template>
         </div>
 
@@ -1139,12 +1227,47 @@ onBeforeUnmount(() => {
 }
 .tabs button.active .count { background: var(--indigo-500); color: var(--paper-50); }
 
-.preview-wrap, .history-wrap {
+.preview-wrap, .history-wrap, .code-wrap {
   flex: 1; background: var(--paper-50); border: 1px solid var(--line-soft);
   border-radius: var(--r-m); min-height: 0; display: flex; flex-direction: column;
   overflow: hidden; box-shadow: 0 1px 3px rgba(28,35,51,.04);
 }
 .history-wrap { overflow-y: auto; }
+
+/* ============ 源代码面板 ============ */
+.code-head {
+  display: flex; align-items: center; gap: 10px; padding: 13px 18px;
+  border-bottom: 1px solid var(--line-soft); font-size: 14px;
+}
+.code-fname { font-family: var(--font-mono); font-size: 13px; color: var(--ink-100); }
+.code-head .meta { color: var(--ink-30); font-size: 12px; font-family: var(--font-mono); }
+.flex-spacer { flex: 1; }
+.code-act {
+  color: var(--indigo-500); font-size: 12.5px; font-weight: 600;
+  border: 1px solid rgba(61, 79, 196, .3); border-radius: 8px;
+  padding: 6px 14px; transition: all .18s ease; background: var(--paper-50);
+}
+.code-act:hover { background: var(--indigo-50); border-color: var(--indigo-500); }
+.code-act:disabled { opacity: .4; cursor: not-allowed; }
+.code-loading { margin: auto; color: var(--ink-55); font-size: 13px; padding: 60px 20px; }
+.code-body { flex: 1; display: flex; min-height: 0; overflow: auto; background: var(--paper-100); }
+.code-gutter {
+  flex: none; padding: 14px 10px 40px 16px; text-align: right; user-select: none;
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.7;
+  color: var(--ink-30); border-right: 1px solid var(--line-soft); background: var(--paper-150);
+  white-space: pre;
+}
+.code-pre {
+  flex: 1; padding: 14px 20px 40px; margin: 0;
+  font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7;
+  white-space: pre; tab-size: 2;
+}
+.code-pre code { color: var(--ink-80); }
+.tok-tag { color: var(--indigo-600); font-weight: 600; }
+.tok-attr { color: var(--teal-600); }
+.tok-str { color: var(--amber); }
+.tok-cmt { color: var(--ink-30); font-style: italic; }
+.tok-pun { color: var(--ink-55); }
 .empty-tip { color: var(--ink-55); font-size: 13px; text-align: center; }
 .empty-tip.big { margin: auto; padding: 60px 20px; line-height: 2; font-size: 15px; font-weight: 600; color: var(--ink-80); }
 .empty-tip.big span { display: block; font-size: 13px; font-weight: 400; color: var(--ink-55); }

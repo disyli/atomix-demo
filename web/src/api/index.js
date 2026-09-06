@@ -26,6 +26,10 @@ export const api = {
   getEvents: (id) => request('/api/projects/' + id + '/events'),
   // 同一 project 的完整对话历史（每轮 user/assistant 消息），刷新/回看时还原对话
   getMessages: (id) => request('/api/projects/' + id + '/messages'),
+  // 当前项目生成应用的源码（专门代码展示区数据来源；download=1 走下载链接）
+  getSource: (id) => request('/api/projects/' + id + '/source'),
+  sourceDownloadUrl: (id) => BASE + '/api/projects/' + id + '/source?download=1&t=' +
+    encodeURIComponent(localStorage.getItem('atomix_token') || ''),
   // 迭代修改：在已有项目上追加自然语言修改指令（后端走 ReAct 循环）
   refine: (id, instruction) => request('/api/projects/' + id + '/refine', { method: 'POST', body: JSON.stringify({ instruction }) }),
   // 预览接口由 iframe 直接加载，无法携带 Authorization 头，

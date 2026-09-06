@@ -44,6 +44,7 @@ func Register(r *gin.Engine, h *Handlers) {
 	authed.GET("/projects/:id/events", h.getEvents)
 	authed.GET("/projects/:id/messages", h.getProjectMessages)
 	authed.GET("/projects/:id/preview", h.previewHTML)
+	authed.GET("/projects/:id/source", h.projectSource)
 	authed.GET("/generate", h.generateSSE)
 	authed.POST("/projects/:id/refine", h.refineSSE)
 	authed.POST("/chat", h.chatIntent)
@@ -172,6 +173,30 @@ func truncateText(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+// sanitizeFilename 清洗项目名为安全文件名：保留中文/字母/数字/连字符下划线，其余替换为 -，限长 60。
+func sanitizeFilename(name string) string {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(name) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r > 0x4e00 && r < 0x9fff:
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if len(out) > 60 {
+		out = out[:60]
+	}
+	// 逐 rune 截断防中文截半
+	rs := []rune(out)
+	if len(rs) > 60 {
+		out = string(rs[:60])
+	}
+	return out
 }
 
 func cors() gin.HandlerFunc {
@@ -309,7 +334,34 @@ func (h *Handlers) getProjectMessages(c *gin.Context) {
 	c.JSON(http.StatusOK, ms)
 }
 
-// previewHTML 以独立文档形式返回生成的应用（供 iframe srcdoc/src 使用）。
+// projectSource 返回当前项目生成应用的完整源码（HTML 文档）。
+// 默认 application/json（前端代码面板用），download=1 时以附件形式下发原始 HTML，
+// 文件名取项目名（去扩展、白名单字符、限长），Content-Disposition 安全头。
+func (h *Handlers) projectSource(c *gin.Context) {
+	var p store.Project
+	if err := store.DB.Where("id = ? AND user_id = ?", c.Param("id"), middleware.UID(c)).First(&p).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "项目不存在"})
+		return
+	}
+	if p.HTML == "" {
+		c.JSON(http.StatusOK, gin.H{"name": p.Name, "filename": "", "source": "", "size": 0, "lines": 0})
+		return
+	}
+	filename := sanitizeFilename(p.Name)
+	if filename == "" {
+		filename = "atomix-app-" + strconv.FormatUint(uint64(p.ID), 10)
+	}
+	if c.Query("download") == "1" {
+		c.Header("Content-Disposition", "attachment; filename=\""+filename+".html\"")
+		c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(p.HTML))
+		return
+	}
+	lines := strings.Count(p.HTML, "\n") + 1
+	c.JSON(http.StatusOK, gin.H{
+		"name": p.Name, "filename": filename + ".html",
+		"source": p.HTML, "size": len(p.HTML), "lines": lines,
+	})
+}
 // 沙箱 iframe 无 allow-same-origin 时产物访问 localStorage 会抛 SecurityError，
 // 这里在 <head> 前注入存储垫片：探测失败则以内存存储降级并通知父页面。
 func (h *Handlers) previewHTML(c *gin.Context) {
