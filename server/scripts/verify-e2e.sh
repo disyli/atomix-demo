@@ -125,16 +125,31 @@ PREVIEW=$(curl -s "$BASE/api/projects/$PROJECT_ID/preview?t=$TOKEN")
 if echo "$PREVIEW" | grep -qi 'dark'; then ok "预览包含深色模式相关内容"; else bad "预览未发现 dark 关键词"; fi
 if echo "$PREVIEW" | grep -qiE 'filter|筛选|分类'; then ok "预览包含分类筛选相关内容"; else bad "预览未发现 filter/筛选/分类 关键词"; fi
 
+echo "=== 断言 E: 源代码接口（代码展示区数据来源）==="
+curl -s "$BASE/api/projects/$PROJECT_ID/source" -H "Authorization: Bearer $TOKEN" > "$TMPDIR_E2E/source.json"
+python3 - "$TMPDIR_E2E/source.json" <<'PYEOF'
+import sys, json
+d = json.load(open(sys.argv[1]))
+ok = bool(d.get("source")) and d.get("lines", 0) > 50 and "<html" in d["source"].lower() and d.get("filename","").endswith(".html")
+print("  name=%s filename=%s lines=%s size=%s" % (d.get("name"), d.get("filename"), d.get("lines"), d.get("size")))
+sys.exit(0 if ok else 1)
+PYEOF
+[ $? -eq 0 ] && ok "源码接口返回完整 HTML（行数/文件名/体积）" || bad "源码接口返回异常（详见上方输出）"
+DL_HEAD=$(curl -s -o /dev/null -D - "$BASE/api/projects/$PROJECT_ID/source?download=1&t=$TOKEN" | tr -d '\r')
+if echo "$DL_HEAD" | grep -qi 'content-disposition: attachment'; then ok "下载接口返回附件头（Content-Disposition）"; else bad "下载接口无附件头: $(echo "$DL_HEAD" | head -3)"; fi
+
 echo "=== 断言 D: chat 消息挂到同一 project ==="
 curl -s -X POST "$BASE/api/chat" -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $TOKEN" \
   -d "{\"message\":\"你好呀\",\"mode\":\"build\",\"projectId\":$PROJECT_ID}" > "$TMPDIR_E2E/chat2.json"
 CHAT_REPLY=$(python3 -c 'import json;d=json.load(open("'$TMPDIR_E2E/chat2.json'"));print(d.get("reply","") or d.get("brief",""))' 2>/dev/null)
 [ -n "$CHAT_REPLY" ] && ok "chat 返回 reply 并落库" || bad "chat 无 reply: $(head -c 120 "$TMPDIR_E2E/chat2.json")"
-curl -s "$BASE/api/projects/$PROJECT_ID/messages" -H "Authorization: Bearer $TOKEN" > "$TMPDIR_E2E/msgs2.json"
-python3 - "$TMPDIR_E2E/msgs2.json" <<'PYEOF'
-import sys, json
-ms = json.load(open(sys.argv[1]))
+python3 - "$BASE" "$TOKEN" "$PROJECT_ID" <<'PYEOF'
+import sys, json, urllib.request
+base, token, pid = sys.argv[1], sys.argv[2], sys.argv[3]
+req = urllib.request.Request(base + '/api/projects/' + pid + '/messages',
+                              headers={'Authorization': 'Bearer ' + token})
+ms = json.load(urllib.request.urlopen(req))
 users = [m for m in ms if m['role'] == 'user' and m.get('kind') == 'text']
 texts = [m for m in ms if m['role'] == 'assistant' and m.get('kind') == 'text']
 print('  chat 后: user(text)=%d assistant(text)=%d' % (len(users), len(texts)))
