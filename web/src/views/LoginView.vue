@@ -46,7 +46,7 @@ async function submit() {
 
     <div class="hero">
       <div class="login-card">
-        <p class="eyebrow">Atomix Studio · v1.0</p>
+        <p class="eyebrow">Atomix Studio · v1.1</p>
         <h1 class="title serif">把想法变成<br /><em>产品</em></h1>
         <p class="tagline">AI Agent 团队用于验证想法、构建产品。几分钟内完成，无需编码。</p>
 
