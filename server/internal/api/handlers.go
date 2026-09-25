@@ -532,6 +532,9 @@ func (h *Handlers) generateSSE(c *gin.Context) {
 
 	runID, runCtx := h.Agent.Runs.Start(uid)
 	defer h.Agent.Runs.Remove(runID)
+	// 流开始即下发 runId：前端的停止按钮依赖它调用 /runs/:runId/cancel，
+	// 只在结束时发送会让进行中的任务永远无法被真正取消
+	send("runId", runID)
 
 	project, err := h.Agent.Run(runCtx, uid, brief, mode, attachIDs, agent.PipelineEvents{
 		OnStage: func(stage, message string) {
@@ -597,6 +600,9 @@ func (h *Handlers) refineSSE(c *gin.Context) {
 
 	runID, runCtx := h.Agent.Runs.Start(uid)
 	defer h.Agent.Runs.Remove(runID)
+	// 流开始即下发 runId：前端的停止按钮依赖它调用 /runs/:runId/cancel，
+	// 只在结束时发送会让进行中的任务永远无法被真正取消
+	send("runId", runID)
 
 	updated, err := h.Agent.Refine(runCtx, uid, p.ID, req.Instruction, req.AttachmentIDs, agent.PipelineEvents{
 		OnStage: func(stage, message string) {
