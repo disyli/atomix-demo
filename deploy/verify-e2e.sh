@@ -186,9 +186,16 @@ if [ -n "$PID" ]; then
   if [ -n "$RUN_ID" ]; then
     say "捕获 runId=$RUN_ID，调用正式停止接口"
     CANCEL_CODE=$(curl -sk -o /dev/null -w '%{http_code}' -X POST "$BASE/api/runs/$RUN_ID/cancel" -H "Authorization: Bearer $TAcc")
-    if [ "$CANCEL_CODE" = "200" ]; then ok "停止接口受理（200）"; else bad "停止接口异常（$CANCEL_CODE）"; fi
+    if [ "$CANCEL_CODE" = "200" ]; then
+      ok "停止接口受理（200）"
+    elif [ "$CANCEL_CODE" = "404" ]; then
+      say "（runId 已结束被清理——任务完成太快，404 属正常时序；改为断流验证）"
+      kill $STUB_PID 2>/dev/null
+    else
+      bad "停止接口异常（$CANCEL_CODE）"
+    fi
   else
-    say "（未捕获 runId——demo 模式构建太快已结束，改为直接断开连接）"
+    say "（未捕获 runId——构建太快已结束，改为直接断开连接）"
     kill $STUB_PID 2>/dev/null
   fi
   sleep 3
@@ -259,16 +266,27 @@ fi
 section "8. 登录页游客入口（静态资源）"
 APP_JS=$($CURL "$BASE/" | grep -o 'assets/index-[^"]*\.js' | head -1)
 if [ -n "$APP_JS" ]; then ok "前端资源已就绪: $APP_JS"; else bad "前端入口异常"; fi
-# SPA 懒加载：guest 按钮与 auth/guest 调用在 LoginView chunk 中，文件名映射藏在 index bundle 里
+# SPA 懒加载：guest 调用可能在共享 chunk（api 模块）或 LoginView chunk，扫描入口引用的全部 chunks
 INDEX_BODY=$($CURL "$BASE/$APP_JS")
 LOGIN_CHUNK=$(echo "$INDEX_BODY" | grep -o 'LoginView-[A-Za-z0-9_-]*\.js' | head -1)
+GUEST_HIT=""
+LOGIN_HIT=""
 if [ -n "$LOGIN_CHUNK" ]; then
   LOGIN_BODY=$($CURL "$BASE/assets/$LOGIN_CHUNK")
-  if echo "$LOGIN_BODY" | grep -q "auth/guest"; then ok "游客入口已包含在前端代码中（$LOGIN_CHUNK 含 auth/guest 调用）"; else bad "LoginView chunk 未发现游客登录调用"; fi
-  if echo "$LOGIN_BODY" | grep -q "游客"; then ok "游客入口按钮文案已包含在前端代码中"; else bad "LoginView chunk 未发现游客文案"; fi
-else
-  if echo "$INDEX_BODY" | grep -q "auth/guest"; then ok "游客入口已包含在前端代码中（index bundle 内联）"; else bad "未能定位 LoginView chunk 且 index bundle 无 auth/guest"; fi
+  if echo "$LOGIN_BODY" | grep -q "auth/guest"; then GUEST_HIT=$LOGIN_CHUNK; fi
+  if echo "$LOGIN_BODY" | grep -q "游客"; then LOGIN_HIT=$LOGIN_CHUNK; fi
 fi
+if [ -z "$GUEST_HIT" ]; then
+  # 扫描 index bundle 自身与其他 chunk（api 共享模块可能内联或独立 chunk）
+  for ch in $(echo "$INDEX_BODY" | grep -o '[A-Za-z0-9_-]*-[A-Za-z0-9_-]*\.js' | sort -u); do
+    body=$($CURL "$BASE/assets/$ch")
+    if [ -z "$GUEST_HIT" ] && echo "$body" | grep -q "auth/guest"; then GUEST_HIT=$ch; fi
+    if [ -z "$LOGIN_HIT" ] && echo "$body" | grep -q "游客"; then LOGIN_HIT=$ch; fi
+    [ -n "$GUEST_HIT" ] && [ -n "$LOGIN_HIT" ] && break
+  done
+fi
+if [ -n "$GUEST_HIT" ]; then ok "游客登录调用已部署（auth/guest 位于 $GUEST_HIT）"; else bad "全部前端 chunk 未发现 auth/guest 调用"; fi
+if [ -n "$LOGIN_HIT" ]; then ok "游客入口按钮文案已部署（游客文案位于 $LOGIN_HIT）"; else bad "全部前端 chunk 未发现游客文案"; fi
 
 echo
 echo -e "\e[1m══════════ 汇总 ══════════\e[0m"
