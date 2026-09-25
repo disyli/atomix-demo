@@ -241,7 +241,11 @@ func (rt *reactSession) toolCommitPlan(argsJSON string) toolResult {
 func (rt *reactSession) toolWrite(argsJSON string) toolResult {
 	var args writeArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return toolResult{OK: false, Observe: "write_file 参数解析失败：" + err.Error()}
+		guard := ""
+		if len(argsJSON) > 8000 {
+			guard = "原因判定：参数体积 " + fmt.Sprint(len(argsJSON)) + " 字符已接近输出上限，上一次输出疑似被截断。请把产物精简到 9000 字符以内（删减注释与冗余样式、压缩实现）后重试，必要时分两次：先 write_file 精简骨架，再用 edit_file 补充功能。"
+		}
+		return toolResult{OK: false, Observe: "write_file 参数解析失败：" + err.Error() + "。请完整输出 JSON 参数（content 为完整 HTML 字符串，注意转义）。" + guard}
 	}
 	if rt.phase == "plan" {
 		return toolResult{OK: false, Observe: "规划阶段禁止写入：请先完成规划并调用 commit_plan 解锁实施工具。"}
@@ -272,7 +276,11 @@ func (rt *reactSession) toolWrite(argsJSON string) toolResult {
 func (rt *reactSession) toolEdit(argsJSON string) toolResult {
 	var args editArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return toolResult{OK: false, Observe: "edit_file 参数解析失败：" + err.Error()}
+		guard := ""
+		if len(argsJSON) > 8000 {
+			guard = "原因判定：参数体积 " + fmt.Sprint(len(argsJSON)) + " 字符接近输出上限，疑似被截断。请缩小 old_string/new_string 片段（一次只替换一处小片段）后重试。"
+		}
+		return toolResult{OK: false, Observe: "edit_file 参数解析失败：" + err.Error() + "。请完整输出 JSON 参数。old_string 必须与产物原文精确一致。" + guard}
 	}
 	if rt.phase == "plan" {
 		return toolResult{OK: false, Observe: "规划阶段禁止修改产物：请先 commit_plan 解锁实施工具。"}

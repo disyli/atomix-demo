@@ -156,8 +156,7 @@ fi
 section "4. 失败落库与最后成功版本保留"
 if [ -n "$PID" ]; then
   # 真实触发一轮「未完成」：发起第三轮 refine 后立即取消（stop），
-  # 状态机必须落库 stopped 而非卡在 generating，且产物保留最后成功版本
-  BEFORE=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID")
+  # 状态机必须落库 stopped 而非卡在 generating，且产物保留最后成功版本  BEFORE=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID")
   BV=$(json_get "$BEFORE" version)
   BS=$(json_get "$BEFORE" status)
   ok "基线核对: status=$BS v=$BV"
@@ -179,6 +178,8 @@ if [ -n "$PID" ]; then
   if [ -n "$(json_get "$SRC_KEEP" source)" ]; then ok "失败/中断后源码保留（最后成功版本）"; else bad "源码丢失"; fi
   PV_KEEP=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/preview")
   if [ -n "$PV_KEEP" ]; then ok "失败/中断后预览仍可用"; else bad "预览丢失"; fi
+else
+  say "（第 3 节基线项目未建成，跳过失败落库断言）"
 fi
 
 section "5. 版本快照与回滚原子性"
@@ -198,6 +199,8 @@ if [ -n "$PID" ]; then
   # 回滚到不存在版本必须 400/报错
   RB=$(curl -sk -o /dev/null -w '%{http_code}' -X POST "$BASE/api/projects/$PID/rollback" -H "Authorization: Bearer $TAcc" -H 'Content-Type: application/json' -d '{"version":999}')
   if [ "$RB" != "200" ]; then ok "回滚不存在版本被拒绝（$RB）"; else bad "回滚不存在版本返回 200"; fi
+else
+  say "（第 3 节基线项目未建成，跳过快照/回滚断言）"
 fi
 
 section "6. 退出重登（会话持久性）"
@@ -205,8 +208,12 @@ if [ -n "$TAcc" ]; then
   PROJ2=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects")
   CNT2=$(echo "$PROJ2" | grep -o '"id":' | wc -l)
   if [ "$CNT2" -ge 1 ]; then ok "重登后（同 token）项目列表完整（$CNT2 个）"; else bad "项目列表丢失"; fi
-  MSG=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/messages")
-  if echo "$MSG" | grep -q '"role":"user"'; then ok "对话历史持久化（Message 表还原）"; else bad "对话历史丢失"; fi
+  if [ -n "$PID" ]; then
+    MSG=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/messages")
+    if echo "$MSG" | grep -q '"role":"user"'; then ok "对话历史持久化（Message 表还原）"; else bad "对话历史丢失"; fi
+  else
+    say "（第 3 节基线项目未建成，跳过对话历史断言）"
+  fi
 fi
 
 section "7. 账号隔离"
@@ -214,13 +221,18 @@ if [ -n "$PID" ]; then
   TX=$($CURL -X POST "$BASE/api/auth/guest"); TIsol=$(json_get "$TX" token)
   CROSS=$(curl -sk -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TIsol" "$BASE/api/projects/$PID")
   if [ "$CROSS" = "404" ] || [ "$CROSS" = "403" ]; then ok "游客 B 无法访问游客 A 的项目（隔离生效，$CROSS）"; else bad "跨账号访问未隔离（$CROSS）"; fi
+else
+  say "（第 3 节基线项目未建成，跳过账号隔离断言）"
 fi
 
 section "8. 登录页游客入口（静态资源）"
 LOGIN_HTML=$($CURL "$BASE/login")
-if echo "$LOGIN_HTML" | grep -q "guest\|游客"; then ok "登录页含游客入口（前端已部署）"; else bad "登录页未见游客入口"; fi
 APP_JS=$($CURL "$BASE/" | grep -o 'assets/index-[^"]*\.js' | head -1)
 if [ -n "$APP_JS" ]; then ok "前端资源已就绪: $APP_JS"; else bad "前端入口异常"; fi
+# SPA 的 index.html 是空壳，游客入口按钮在 JS bundle 里
+JS_BODY=$($CURL "$BASE/$APP_JS")
+if echo "$JS_BODY" | grep -q "auth/guest"; then ok "游客入口已包含在前端代码中（auth/guest 调用存在）"; else bad "JS bundle 未发现游客登录调用"; fi
+if echo "$JS_BODY" | grep -q "游客"; then ok "游客入口按钮文案已包含在前端代码中"; else say "（bundle 压缩可能改变中文文案，仅作参考）"; fi
 
 echo
 echo -e "\e[1m══════════ 汇总 ══════════\e[0m"

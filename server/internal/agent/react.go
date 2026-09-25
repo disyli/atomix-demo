@@ -71,12 +71,13 @@ func reactPrompt(brief, refineTo, mode string) string {
 
 硬性规则：
 1. 产物是一个完整 <!DOCTYPE html> 文档：HTML + CSS + 原生 JS（可用 Tailwind CDN），中文界面，UI 精致现代
-2. 数据用 localStorage 持久化（沙箱内不可用时平台会自动降级，无需担心）
-3. 禁止使用 document.cookie（沙箱环境会抛 SecurityError）
-4. 必须包含真实交互（事件绑定、DOM 更新），不能是静态页面
-5. run_checks 返回 issues 时必须修复并重新提交产物，直到校验通过才能 finish；小问题优先用 edit_file 精准修复，整体性缺陷才 write_file 重写
-6. 每轮先用一两句话正文说明本轮思路（为什么这么做、下一步做什么），再发起工具调用；正文不要为空
-7. 不要空转：同一工具不要连续重复调用，除非按规则修复后重写`)
+2. 产物必须精炼：总字符控制在 9000 以内，不写冗余注释与无用样式，实现上点到为止（输出体积有硬上限，超出会被截断导致写入失败）
+3. 数据用 localStorage 持久化（沙箱内不可用时平台会自动降级，无需担心）
+4. 禁止使用 document.cookie（沙箱环境会抛 SecurityError）
+5. 必须包含真实交互（事件绑定、DOM 更新），不能是静态页面
+6. run_checks 返回 issues 时必须修复并重新提交产物，直到校验通过才能 finish；小问题优先用 edit_file 精准修复，整体性缺陷才 write_file 重写
+7. 每轮先用一两句话正文说明本轮思路（为什么这么做、下一步做什么），再发起工具调用；正文不要为空
+8. 不要空转：同一工具不要连续重复调用，除非按规则修复后重写`)
 	switch mode {
 	case "plan":
 		sb.WriteString(`
