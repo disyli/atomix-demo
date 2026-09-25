@@ -51,7 +51,24 @@ func (a *Agent) LockProject(projectID uint) func() {
 	return mu.Unlock
 }
 
-// PipelineEvents 流水线事件回调。
+// TryLockProject 尝试获取项目锁，立即返回（不阻塞）。
+// 返回 (释放函数, true) 表示成功获取；(nil, false) 表示当前已被占用。
+func (a *Agent) TryLockProject(projectID uint) (func(), bool) {
+	a.projectMuMu.Lock()
+	if a.projectMus == nil {
+		a.projectMus = map[uint]*sync.Mutex{}
+	}
+	mu, ok := a.projectMus[projectID]
+	if !ok {
+		mu = &sync.Mutex{}
+		a.projectMus[projectID] = mu
+	}
+	a.projectMuMu.Unlock()
+	if mu.TryLock() {
+		return mu.Unlock, true
+	}
+	return nil, false
+}
 type PipelineEvents struct {
 	OnStage  func(stage, message string)
 	OnDetail func(stage, message, level string)

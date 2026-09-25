@@ -40,6 +40,8 @@ export const api = {
   refine: (id, instruction) => request('/api/projects/' + id + '/refine', { method: 'POST', body: JSON.stringify({ instruction }) }),
   // 签发短期票据（60s），用于 preview/download URL，避免长期 token 出现在访问日志
   issueTicket: () => request('/api/ticket', { method: 'POST', body: '{}' }),
+  // fetchTicket：预取票据但不使用（定时器静默续约用，不刷新 iframe src）
+  fetchTicket: () => request('/api/ticket', { method: 'POST', body: '{}' }),
   // 预览 URL：先换取 60s ticket，再拼入 URL（ticket 比长期 token 安全，过期即失效）
   previewUrl: async (id, payload) => {
     let ticket = ''

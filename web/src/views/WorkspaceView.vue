@@ -524,13 +524,13 @@ async function setActiveProject(p) {
   // 清除旧的 ticket 刷新计时器
   if (previewTicketTimer) { clearInterval(previewTicketTimer); previewTicketTimer = null }
   previewUrl.value = await api.previewUrl(p.id, readAppData(p.id))
-  // 每 50s 自动换新 ticket，防止 60s 过期后 iframe/新窗口返回 401
+  // 每 50s 静默预取新 ticket 并缓存（不改 previewUrl/不重载 iframe），
+  // 仅在用户主动点「新窗口」或 iframe 出错时再使用新 ticket。
   previewTicketTimer = setInterval(async () => {
-    if (activeProject.value?.id === p.id) {
-      previewUrl.value = await api.previewUrl(p.id, readAppData(p.id))
-    } else {
-      clearInterval(previewTicketTimer); previewTicketTimer = null
+    if (activeProject.value?.id !== p.id) {
+      clearInterval(previewTicketTimer); previewTicketTimer = null; return
     }
+    try { await api.fetchTicket() } catch (_) {} // 只预取，不改 src
   }, 50 * 1000)
   rightTab.value = 'preview'
   codeView.value = { loading: false, name: '', filename: '', source: '', lines: 0, size: 0, copied: false }
@@ -765,7 +765,8 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   window.removeEventListener('message', onShimMessage)
-  window.removeEventListener('click', onDocClick)
+  document.removeEventListener('click', onDocClick)
+  if (previewTicketTimer) { clearInterval(previewTicketTimer); previewTicketTimer = null }
 })
 </script>
 

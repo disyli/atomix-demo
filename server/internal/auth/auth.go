@@ -2,6 +2,7 @@ package auth
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -12,6 +13,9 @@ import (
 type Claims struct {
 	UserID uint   `json:"uid"`
 	Email  string `json:"email"`
+	// Use 标记令牌用途："" 或 "token" 表示长期登录令牌，"ticket" 表示短期预览/下载票据。
+	// IssueTicket 会写入 "ticket"，issueToken 不写（保持空）。
+	Use string `json:"use,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -39,13 +43,16 @@ func IssueToken(secret string, userID uint, email string) (string, error) {
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
 }
 
-// IssueTicket 签发 60 秒有效期的短期票据（预览/下载专用），
-// 用独立的 ticketSecret 签名，过期后无法复用，避免长期 token 出现在访问日志。
+// IssueTicket 签发 60 秒有效期的短期票据（预览/下载专用）。
+// Claims.Use = "ticket" 标记用途，jti 为随机 ID（防票据被客户端缓存后反复使用）。
 func IssueTicket(ticketSecret string, userID uint, email string) (string, error) {
+	jti := fmt.Sprintf("%d-%x", userID, time.Now().UnixNano())
 	claims := Claims{
 		UserID: userID,
 		Email:  email,
+		Use:    "ticket",
 		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        jti,
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(60 * time.Second)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},

@@ -42,8 +42,9 @@ func Register(r *gin.Engine, h *Handlers) {
 	})
 
 	api := r.Group("/api")
-	api.POST("/auth/register", h.register)
-	api.POST("/auth/login", h.login)
+	// 注册/登录：每 IP 每分钟最多 10 次，防止暴力破解与批量注册
+	api.POST("/auth/register", authRateLimiter(), h.register)
+	api.POST("/auth/login", authRateLimiter(), h.login)
 	// 游客接口：每 IP 每分钟最多 5 次，防止批量刷库与余额消耗
 	api.POST("/auth/guest", guestRateLimiter(), h.guestLogin)
 
@@ -56,7 +57,8 @@ func Register(r *gin.Engine, h *Handlers) {
 	authed.GET("/projects/:id/messages", h.getProjectMessages)
 	authed.GET("/projects/:id/snapshots", h.listSnapshots)
 	authed.POST("/projects/:id/rollback", h.rollbackVersion)
-	authed.GET("/generate", h.generateSSE)
+	// generate 用 ticketOrBearer：EventSource 无法设 Authorization 头，需要 ticket 参数
+	// 票据仅在此接口接受，无法用于写操作（authed 组已拒绝 ticket）
 	authed.POST("/projects/:id/refine", h.refineSSE)
 	authed.POST("/chat", h.chatIntent)
 	authed.POST("/attachments", h.uploadAttachment)
@@ -64,13 +66,15 @@ func Register(r *gin.Engine, h *Handlers) {
 	authed.GET("/attachments/:id", h.getAttachment)
 	authed.POST("/permissions/:reqId", h.resolvePermission)
 	authed.POST("/runs/:runId/cancel", h.cancelRun)
-	// ticket：为 preview/download 等需要在 URL query 传凭据的场景签发一次性短期令牌（60s），
+	// ticket：为 preview/download/generate 等需要在 URL query 传凭据的场景签发短期令牌（60s），
 	// 避免长期 token 写入 nginx 访问日志
 	authed.POST("/ticket", h.issueTicket)
 
-	// 票据验证路由（不在 authed 组，用 ticket 参数鉴权）
-	r.GET("/api/projects/:id/preview", ticketOrBearer(h.Cfg.JWTSecret, h.Cfg.TicketSecret), h.previewHTML)
-	r.GET("/api/projects/:id/source", ticketOrBearer(h.Cfg.JWTSecret, h.Cfg.TicketSecret), h.projectSource)
+	// 票据验证路由（不在 authed 组，只接受 ticket 或 Bearer）
+	tb := ticketOrBearer(h.Cfg.JWTSecret, h.Cfg.TicketSecret)
+	r.GET("/api/generate", tb, h.generateSSE)
+	r.GET("/api/projects/:id/preview", tb, h.previewHTML)
+	r.GET("/api/projects/:id/source", tb, h.projectSource)
 }
 
 // guestLogin 一次性评审账号：每次调用创建独立 guest 用户（guest_时间戳@guest.atomix），
@@ -140,8 +144,13 @@ func (h *Handlers) rollbackVersion(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "项目不存在"})
 		return
 	}
-	// 同一项目同时只允许一次构建/回滚，防并发覆盖
-	defer h.Agent.LockProject(own.ID)()
+	// 同一项目同时只允许一次构建/回滚；构建进行中直接返回 409，不阻塞等待
+	unlock, ok := h.Agent.TryLockProject(own.ID)
+	if !ok {
+		c.JSON(http.StatusConflict, gin.H{"error": "项目正在构建中，请等待完成后再回滚"})
+		return
+	}
+	defer unlock()
 	p, snap, err := store.RollbackSnapshot(own.ID, req.Version)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -664,14 +673,20 @@ func (h *Handlers) issueTicket(c *gin.Context) {
 }
 
 // ticketOrBearer 双通道鉴权中间件：
-//  - 有 ticket 查询参数时用票据密钥验证（短期，供 preview/download URL 使用）
-//  - 否则回退到 Authorization Bearer token 验证（正常 API 调用路径）
+//   - 有 ticket 查询参数时用票据密钥验证（短期，供 preview/download/generate URL 使用）
+//     并校验 Use == "ticket"，防止长期 token 当票据用
+//   - 否则回退到 Authorization Bearer token 验证（正常 API 调用路径）
 func ticketOrBearer(jwtSecret, ticketSecret string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if t := c.Query("ticket"); t != "" {
 			claims, err := auth.ParseToken(ticketSecret, t)
 			if err != nil {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "票据无效或已过期"})
+				return
+			}
+			// 票据必须携带 use=ticket 标志，防止旧格式或伪造的长期 token 混入
+			if claims.Use != "ticket" {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "非法票据类型"})
 				return
 			}
 			c.Set("uid", claims.UserID)
@@ -690,6 +705,10 @@ func ticketOrBearer(jwtSecret, ticketSecret string) gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 			return
 		}
+		if claims.Use == "ticket" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "ticket 不可作为 Bearer 使用"})
+			return
+		}
 		c.Set("uid", claims.UserID)
 		c.Set("email", claims.Email)
 		c.Next()
@@ -704,6 +723,55 @@ func randomHex(n int) string {
 		return fmt.Sprintf("%x%x", time.Now().UnixNano(), time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// authRateLimiter 注册/登录速率限制：每 IP 每分钟最多 10 次，
+// 防止暴力破解密码和批量注册。与 guestRateLimiter 逻辑相同，只改限额。
+func authRateLimiter() gin.HandlerFunc {
+	type entry struct {
+		count    int
+		windowMs int64
+	}
+	var mu sync.Mutex
+	ipMap := map[string]*entry{}
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now().UnixMilli()
+			mu.Lock()
+			for ip, e := range ipMap {
+				if now-e.windowMs >= int64(2*60*1000) {
+					delete(ipMap, ip)
+				}
+			}
+			mu.Unlock()
+		}
+	}()
+	return func(c *gin.Context) {
+		ip := c.GetHeader("X-Real-IP")
+		if ip == "" {
+			ip = c.ClientIP()
+		}
+		now := time.Now().UnixMilli()
+		const (windowSize = int64(60 * 1000); limit = 10)
+		mu.Lock()
+		e, ok := ipMap[ip]
+		if !ok || now-e.windowMs >= windowSize {
+			ipMap[ip] = &entry{count: 1, windowMs: now}
+			mu.Unlock()
+			c.Next()
+			return
+		}
+		e.count++
+		over := e.count > limit
+		mu.Unlock()
+		if over {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "请求过于频繁，请稍后再试"})
+			return
+		}
+		c.Next()
+	}
 }
 
 // guestRateLimiter 游客注册速率限制：每 IP 每分钟最多 5 次，防止批量刷库与消耗 LLM 余额。

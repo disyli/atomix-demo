@@ -8,21 +8,15 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// UserIdentity 通过 Authorization 头或短期票据（ticket= query 参数）解析当前用户。
-// ticket= 用于 EventSource 等无法设置请求头的场景（60s 有效，不写入日志危险区）；
-// 旧的 ?t=<长期token> 已废弃，不再接受，防止长期 token 出现在 nginx 访问日志。
-func UserIdentity(jwtSecret, ticketSecret string) gin.HandlerFunc {
+// UserIdentity 通过 Authorization Bearer 头解析当前用户（长期登录 token）。
+// 短期票据（ticket= query 参数）仅被 ticketOrBearer 中间件接受，
+// 用于 preview/source/generate 等 URL 传参场景；其他接口拒绝 ticket，
+// 防止票据被用于写操作（创建项目、迭代等）。
+func UserIdentity(jwtSecret, _ string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 优先检查短期票据（EventSource / preview 场景）
-		if t := c.Query("ticket"); t != "" {
-			claims, err := auth.ParseToken(ticketSecret, t)
-			if err != nil {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "票据无效或已过期"})
-				return
-			}
-			c.Set("uid", claims.UserID)
-			c.Set("email", claims.Email)
-			c.Next()
+		// 短期票据严禁在写接口组使用：返回 401 而不是静默降级
+		if c.Query("ticket") != "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "此接口不接受票据，请使用 Bearer token"})
 			return
 		}
 		// 标准 Bearer token
@@ -34,6 +28,11 @@ func UserIdentity(jwtSecret, ticketSecret string) gin.HandlerFunc {
 		claims, err := auth.ParseToken(jwtSecret, token)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+			return
+		}
+		// 拒绝票据伪造成普通 token 的情形（Use != "" && Use != "token"）
+		if claims.Use == "ticket" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "ticket 不可用于此接口"})
 			return
 		}
 		c.Set("uid", claims.UserID)
