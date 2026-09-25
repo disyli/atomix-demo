@@ -113,7 +113,8 @@ server {
 }
 NGINX
 
-# 释放 80 端口（容器已不再直接占用；若 docker-proxy 仍监听 0.0.0.0:80 则已被上方重建解决）
+# 释放 80 端口：容器已不再直接占用；同时禁用 Ubuntu 默认站点（抢占 80 导致跳转失效）
+rm -f /etc/nginx/sites-enabled/default
 nginx -t && (systemctl is-active nginx >/dev/null 2>&1 && systemctl reload nginx || systemctl enable --now nginx)
 
 echo "==> 部署完成：https://101.32.28.8 （SHA=$GIT_SHA）"
