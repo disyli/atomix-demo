@@ -2,13 +2,16 @@
 package api
 
 import (
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"atomix-demo/server/internal/agent"
@@ -41,7 +44,8 @@ func Register(r *gin.Engine, h *Handlers) {
 	api := r.Group("/api")
 	api.POST("/auth/register", h.register)
 	api.POST("/auth/login", h.login)
-	api.POST("/auth/guest", h.guestLogin)
+	// 游客接口：每 IP 每分钟最多 5 次，防止批量刷库与余额消耗
+	api.POST("/auth/guest", guestRateLimiter(), h.guestLogin)
 
 	authed := api.Group("", middleware.UserIdentity(h.Cfg.JWTSecret))
 	authed.GET("/me", h.me)
@@ -50,8 +54,6 @@ func Register(r *gin.Engine, h *Handlers) {
 	authed.GET("/projects/:id", h.getProject)
 	authed.GET("/projects/:id/events", h.getEvents)
 	authed.GET("/projects/:id/messages", h.getProjectMessages)
-	authed.GET("/projects/:id/preview", h.previewHTML)
-	authed.GET("/projects/:id/source", h.projectSource)
 	authed.GET("/projects/:id/snapshots", h.listSnapshots)
 	authed.POST("/projects/:id/rollback", h.rollbackVersion)
 	authed.GET("/generate", h.generateSSE)
@@ -62,18 +64,28 @@ func Register(r *gin.Engine, h *Handlers) {
 	authed.GET("/attachments/:id", h.getAttachment)
 	authed.POST("/permissions/:reqId", h.resolvePermission)
 	authed.POST("/runs/:runId/cancel", h.cancelRun)
+	// ticket：为 preview/download 等需要在 URL query 传凭据的场景签发一次性短期令牌（60s），
+	// 避免长期 token 写入 nginx 访问日志
+	authed.POST("/ticket", h.issueTicket)
+
+	// 票据验证路由（不在 authed 组，用 ticket 参数鉴权）
+	r.GET("/api/projects/:id/preview", ticketOrBearer(h.Cfg.JWTSecret, h.Cfg.TicketSecret), h.previewHTML)
+	r.GET("/api/projects/:id/source", ticketOrBearer(h.Cfg.JWTSecret, h.Cfg.TicketSecret), h.projectSource)
 }
 
 // guestLogin 一次性评审账号：每次调用创建独立 guest 用户（guest_时间戳@guest.atomix），
 // 返回与注册同构的 token。评审无需注册个人账号或暴露 API Key；开关经
 // ATOMIX_GUEST_ENABLED 控制（默认开）。
+// 游客密码为随机串，登录接口也拒绝 guest_* 账号，杜绝旁观者凭邮箱猜密码登录他人账号。
 func (h *Handlers) guestLogin(c *gin.Context) {
 	if !h.Cfg.GuestEnabled {
 		c.JSON(http.StatusForbidden, gin.H{"error": "游客入口未开放"})
 		return
 	}
 	email := fmt.Sprintf("guest_%d@guest.atomix", time.Now().UnixNano())
-	hash, err := auth.HashPassword("guest-only-no-login")
+	// 随机密码：32 位 hex，只用于创建账号，不对外暴露，使得任何人都无法用密码接口登录游客账号
+	rawPwd := randomHex(16)
+	hash, err := auth.HashPassword(rawPwd)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "服务器错误"})
 		return
@@ -128,6 +140,8 @@ func (h *Handlers) rollbackVersion(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "项目不存在"})
 		return
 	}
+	// 同一项目同时只允许一次构建/回滚，防并发覆盖
+	defer h.Agent.LockProject(own.ID)()
 	p, snap, err := store.RollbackSnapshot(own.ID, req.Version)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -331,6 +345,11 @@ func (h *Handlers) login(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
 		return
 	}
+	// 游客账号只能通过 /auth/guest 接口获取 token，密码接口明确拒绝
+	if strings.HasSuffix(req.Email, "@guest.atomix") {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "邮箱或密码错误"})
+		return
+	}
 	var u store.User
 	if err := store.DB.Where("email = ?", req.Email).First(&u).Error; err != nil || !auth.CheckPassword(u.PasswordHash, req.Password) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "邮箱或密码错误"})
@@ -478,8 +497,7 @@ func (h *Handlers) chatIntent(c *gin.Context) {
 			req.ProjectID = 0
 		}
 	}
-	h.Agent.CurrentUserID = uid
-	r := h.Agent.ClassifyIntent(c.Request.Context(), req.Message, req.AttachmentIDs)
+	r := h.Agent.ClassifyIntent(c.Request.Context(), uid, req.Message, req.AttachmentIDs)
 	// 落库：用户消息 + 助手回复（chat/clarify 时）
 	if req.ProjectID > 0 {
 		store.DB.Create(&store.Message{ProjectID: req.ProjectID, UserID: uid, Role: "user", Kind: "text", Text: req.Message, CreatedAtMs: store.Now()})
@@ -628,4 +646,101 @@ func (h *Handlers) refineSSE(c *gin.Context) {
 	}
 	// 修改成功：每轮对话消息（user + assistant run）已由 Refine 内部落库
 	send("done", toJSON(gin.H{"project": projectBrief(*updated), "runId": runID}))
+}
+
+// issueTicket 为当前登录用户签发一个 60 秒有效的短期票据，
+// 用于 preview/source-download 等需要在 URL query 传凭据的场景。
+// 前端持有该 ticket 后在 URL 里用 ticket= 参数代替 t= token，
+// 避免长期 JWT token 写入 nginx 访问日志。
+func (h *Handlers) issueTicket(c *gin.Context) {
+	uid := middleware.UID(c)
+	email := c.GetString("email")
+	ticket, err := auth.IssueTicket(h.Cfg.TicketSecret, uid, email)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "签发票据失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ticket": ticket, "ttl": 60})
+}
+
+// ticketOrBearer 双通道鉴权中间件：
+//  - 有 ticket 查询参数时用票据密钥验证（短期，供 preview/download URL 使用）
+//  - 否则回退到 Authorization Bearer token 验证（正常 API 调用路径）
+func ticketOrBearer(jwtSecret, ticketSecret string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if t := c.Query("ticket"); t != "" {
+			claims, err := auth.ParseToken(ticketSecret, t)
+			if err != nil {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "票据无效或已过期"})
+				return
+			}
+			c.Set("uid", claims.UserID)
+			c.Set("email", claims.Email)
+			c.Next()
+			return
+		}
+		// 无 ticket 时走 Bearer token（兼容直接 API 调用）
+		token := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+		if token == "" {
+			token = c.Query("t") // 兼容旧链接
+		}
+		if token == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+			return
+		}
+		claims, err := auth.ParseToken(jwtSecret, token)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+			return
+		}
+		c.Set("uid", claims.UserID)
+		c.Set("email", claims.Email)
+		c.Next()
+	}
+}
+
+// randomHex 返回 n 字节的随机十六进制字符串（2n 字符）。
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand 失败极为罕见；兜底用时间戳
+		return fmt.Sprintf("%x%x", time.Now().UnixNano(), time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+// guestRateLimiter 游客注册速率限制：每 IP 每分钟最多 5 次，防止批量刷库与消耗 LLM 余额。
+// 使用内存滑动窗口（服务重启后计数清零，重启本身有一定限流效果）。
+func guestRateLimiter() gin.HandlerFunc {
+	type entry struct {
+		count    int
+		windowMs int64
+	}
+	var mu sync.Mutex
+	ipMap := map[string]*entry{}
+
+	return func(c *gin.Context) {
+		ip := c.ClientIP()
+		now := time.Now().UnixMilli()
+		windowSize := int64(60 * 1000) // 1 分钟
+		const limit = 5
+
+		mu.Lock()
+		e, ok := ipMap[ip]
+		if !ok || now-e.windowMs >= windowSize {
+			ipMap[ip] = &entry{count: 1, windowMs: now}
+			mu.Unlock()
+			c.Next()
+			return
+		}
+		e.count++
+		over := e.count > limit
+		mu.Unlock()
+
+		if over {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "请求过于频繁，请稍后再试"})
+			return
+		}
+		c.Next()
+	}
 }

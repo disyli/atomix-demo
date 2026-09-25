@@ -5,24 +5,50 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"atomix-demo/server/internal/llm"
 )
 
 // Agent 负责编排一次应用生成任务。
 type Agent struct {
-	LLM           llm.Service
-	UseMock       bool
-	CurrentUserID uint // 最近一次请求的用户 ID，用于附件归属校验
+	LLM      llm.Service
+	UseMock  bool
 	// PermRegistry 跨任务权限确认注册表：HTTP 确认接口按请求 ID 回填用户决定
 	PermRegistry *PermRegistry
 	// Runs 活跃构建任务注册表：停止按钮经 /api/runs/:runId/cancel 取消运行中的任务
 	Runs *RunRegistry
+
+	// projectMu 项目级互斥锁：同一个 projectID 同时只允许一次构建或回滚操作，
+	// 防止并发写互相覆盖导致快照和 HTML 不一致。
+	projectMuMu sync.Mutex
+	projectMus  map[uint]*sync.Mutex
 }
 
 // NewAgent 构造带默认组件的 Agent（权限注册表与任务注册表必初始化）。
 func NewAgent(svc llm.Service, useMock bool) *Agent {
-	return &Agent{LLM: svc, UseMock: useMock, PermRegistry: NewPermRegistry(), Runs: NewRunRegistry()}
+	return &Agent{
+		LLM: svc, UseMock: useMock,
+		PermRegistry: NewPermRegistry(), Runs: NewRunRegistry(),
+		projectMus: map[uint]*sync.Mutex{},
+	}
+}
+
+// LockProject 获取指定项目的互斥锁（阻塞直到可用），返回释放函数。
+// 调用方应在 defer 里释放：defer a.LockProject(id)()
+func (a *Agent) LockProject(projectID uint) func() {
+	a.projectMuMu.Lock()
+	if a.projectMus == nil {
+		a.projectMus = map[uint]*sync.Mutex{}
+	}
+	mu, ok := a.projectMus[projectID]
+	if !ok {
+		mu = &sync.Mutex{}
+		a.projectMus[projectID] = mu
+	}
+	a.projectMuMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 // PipelineEvents 流水线事件回调。

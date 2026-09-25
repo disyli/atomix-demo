@@ -41,12 +41,12 @@ func refineIntent(text string, r IntentResult) IntentResult {
 // ClassifyIntent 识别用户消息意图，只做分类与回复，不触发构建流程。
 // attachmentIDs 非空时：图片附件以多模态形式发给 vision 模型，文本附件内容并入消息。
 // 演示模式（UseMock）或 LLM 失败时退化为关键词启发式。
-func (a *Agent) ClassifyIntent(ctx context.Context, text string, attachmentIDs []uint) IntentResult {
+func (a *Agent) ClassifyIntent(ctx context.Context, userID uint, text string, attachmentIDs []uint) IntentResult {
 	text = strings.TrimSpace(text)
 	if text == "" && len(attachmentIDs) == 0 {
 		return IntentResult{Intent: "chat", Reply: "请告诉我你想聊点什么，或者想构建一个什么样的应用。"}
 	}
-	atts := loadAttachments(a, attachmentIDs)
+	atts := loadAttachments(userID, attachmentIDs)
 	hasImage := false
 	var textParts []string
 	for _, at := range atts {
@@ -130,13 +130,13 @@ func (a *Agent) ClassifyIntent(ctx context.Context, text string, attachmentIDs [
 	}
 }
 
-// loadAttachments 按 ID 集合加载属于当前 Agent 用户的附件（无 DB 时返回空）。
-func loadAttachments(a *Agent, ids []uint) []store.Attachment {
+// loadAttachments 按 ID 集合加载属于指定用户的附件（请求级 userID，不走全局共享字段）。
+func loadAttachments(userID uint, ids []uint) []store.Attachment {
 	if len(ids) == 0 {
 		return nil
 	}
 	var out []store.Attachment
-	store.DB.Where("id IN ? AND user_id = ?", ids, a.CurrentUserID).Find(&out)
+	store.DB.Where("id IN ? AND user_id = ?", ids, userID).Find(&out)
 	return out
 }
 

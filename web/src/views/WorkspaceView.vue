@@ -513,9 +513,9 @@ function onShimMessage(e) {
   }
 }
 
-function setActiveProject(p) {
+async function setActiveProject(p) {
   activeProject.value = p
-  previewUrl.value = api.previewUrl(p.id, readAppData(p.id))
+  previewUrl.value = await api.previewUrl(p.id, readAppData(p.id))
   rightTab.value = 'preview'
   codeView.value = { loading: false, name: '', filename: '', source: '', lines: 0, size: 0, copied: false }
   versionView.value = { loading: false, current: p.version || 0, snapshots: [], rolling: 0, notice: '' }
@@ -531,6 +531,22 @@ async function loadSource() {
     codeView.value = { loading: false, name: s.name, filename: s.filename, source: s.source, lines: s.lines, size: s.size, copied: false }
   } catch (e) {
     codeView.value = { loading: false, name: '', filename: '', source: '', lines: 0, size: 0, copied: false }
+  }
+}
+
+/* 下载：先获取短期 ticket 再触发真实下载，避免长期 token 写入日志 */
+async function handleDownload() {
+  if (!activeProject.value) return
+  try {
+    const url = await api.sourceDownloadUrl(activeProject.value.id)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = codeView.value.filename || 'app.html'
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+  } catch (e) {
+    console.error('下载失败', e)
   }
 }
 
@@ -960,8 +976,9 @@ onBeforeUnmount(() => {
               <a
                 v-if="codeView.source"
                 class="code-act"
-                :href="api.sourceDownloadUrl(activeProject.id)"
+                :href="codeView.downloadUrl || '#'"
                 :download="codeView.filename || 'app.html'"
+                @click.prevent="handleDownload"
               >下载</a>
               <button class="code-act" :disabled="codeView.loading" @click="loadSource">刷新</button>
             </div>

@@ -21,6 +21,9 @@ func Open(dataDir string) error {
 		return err
 	}
 	DB = db
+	// 清理上次进程异常退出留下的僵尸 generating 项目：
+	// 重启后这些项目没有对应的运行 goroutine，状态永远不会翻转，保留 LastGoodHTML 兜底预览。
+	DB.Exec("UPDATE projects SET status = 'failed', updated_at_ms = ? WHERE status = 'generating'", Now())
 	return nil
 }
 

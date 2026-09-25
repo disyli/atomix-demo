@@ -78,7 +78,7 @@ func readFileToolDef() llm.Tool {
 func runChecksToolDef() llm.Tool {
 	return llm.Tool{Type: "function", Function: llm.ToolFunction{
 		Name:        "run_checks",
-		Description: "对当前产物执行校验：静态校验（文档结构/沙箱兼容性/存储调用/交互绑定/体积），浏览器可用时叠加无头浏览器实测（运行时异常/console错误/白屏/交互元素）。写入后必须调用；返回的 issues 不为空时须修复后重新提交。",
+		Description: "对当前产物执行校验：静态校验（文档结构/沙箱兼容性/存储调用/交互绑定/体积）；仅当服务器环境已安装 Chromium 时才会叠加无头浏览器实测（运行时异常/console错误/白屏/交互元素），否则只做静态校验。写入后必须调用；返回的 issues 不为空时须修复后重新提交。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {},
@@ -361,10 +361,10 @@ func (rt *reactSession) toolChecks() toolResult {
 	}
 
 	if len(issues) == 0 {
-		rt.detail("verify", "校验全部通过", "info")
+		rt.detail("verify", "静态校验全部通过（当前环境无浏览器，仅完成静态检查）", "info")
 		// 完成门控置位：产物已通过校验，finish 与最终落库均以此为准
 		rt.checksPassed = true
-		return toolResult{OK: true, Observe: "校验通过：文档结构、沙箱兼容性、存储降级、交互绑定、体积均无问题（含浏览器实测）。可以调用 finish 收尾。"}
+		return toolResult{OK: true, Observe: "静态校验通过：文档结构、沙箱兼容性、存储降级、交互绑定、体积均无问题。（注：当前服务器环境无 Chromium，跳过浏览器运行时实测）可以调用 finish 收尾。"}
 	}
 	rt.detail("verify", fmt.Sprintf("发现 %d 个问题，需修复后重新提交产物", len(issues)), "warn")
 	return toolResult{OK: false, Observe: "校验发现以下问题：\n- " + strings.Join(issues, "\n- ") + "\n请针对以上问题修复：小改动用 edit_file 精准替换，整体缺陷用 write_file 重写（剩余次数有限）。"}

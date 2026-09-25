@@ -12,6 +12,8 @@ type Config struct {
 	Port          int
 	DataDir       string
 	JWTSecret     string
+	// TicketSecret 用于签发短期预览票据（60s），与 JWTSecret 分离避免互相干扰
+	TicketSecret  string
 	DeepSeekKey   string
 	DeepSeekURL   string
 	DeepSeekModel string
@@ -52,6 +54,8 @@ func Load() (*Config, error) {
 		DeploySHA:     getEnv("ATOMIX_DEPLOY_SHA", firstNonEmpty(BuiltinDeploySHA, "dev-local")),
 		GuestEnabled:  getEnv("ATOMIX_GUEST_ENABLED", "1") == "1",
 	}
+	// 票据密钥：优先环境变量，未配置时从 JWTSecret 派生（+_ticket 后缀），保持零配置可用
+	cfg.TicketSecret = getEnv("ATOMIX_TICKET_SECRET", cfg.JWTSecret+"_ticket")
 	cfg.UseMock = cfg.DeepSeekKey == ""
 	return cfg, nil
 }

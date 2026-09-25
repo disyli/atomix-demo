@@ -22,6 +22,7 @@ const (
 type reactSession struct {
 	a          *Agent
 	ctx        context.Context
+	userID     uint   // 本次任务归属用户（附件归属校验用，不走全局共享字段）
 	brief      string
 	html       string
 	plan       PlanResult
@@ -153,7 +154,7 @@ func (rt *reactSession) liveRun(ctx context.Context) error {
 		messages = append(messages, llm.ChatMessage{Role: "user", Content: rt.brief})
 	}
 	// 附件上下文：文本附件并入用户消息；图片以多模态 parts 发给 vision 模型
-	if atts := loadAttachments(rt.a, rt.attachIDs); len(atts) > 0 {
+	if atts := loadAttachments(rt.userID, rt.attachIDs); len(atts) > 0 {
 		var parts []llm.ContentPart
 		var textNotes []string
 		for _, at := range atts {
@@ -563,7 +564,7 @@ func mustJSON(v interface{}) string {
 // mode: build | plan | research；attachmentIDs: 随任务携带的附件。
 func (a *Agent) Run(ctx context.Context, userID uint, brief, mode string, attachmentIDs []uint, ev PipelineEvents) (*store.Project, error) {
 	rt := &reactSession{
-		a: a, ctx: ctx, brief: brief, mode: mode, attachIDs: attachmentIDs, ev: ev,
+		a: a, ctx: ctx, userID: userID, brief: brief, mode: mode, attachIDs: attachmentIDs, ev: ev,
 		perm: newPermGateway(a.PermRegistry), budget: newContextBudget(),
 		phase: "act",
 	}
@@ -580,8 +581,10 @@ func (a *Agent) Refine(ctx context.Context, userID, projectID uint, instruction 
 	if err := store.DB.Where("id = ? AND user_id = ?", projectID, userID).First(&p).Error; err != nil {
 		return nil, fmt.Errorf("项目不存在")
 	}
+	// 同一项目同时只允许一次构建/迭代，防并发覆盖
+	defer a.LockProject(projectID)()
 	rt := &reactSession{
-		a: a, ctx: ctx, brief: instruction, html: p.HTML, attachIDs: attachmentIDs, ev: ev,
+		a: a, ctx: ctx, userID: userID, brief: instruction, html: p.HTML, attachIDs: attachmentIDs, ev: ev,
 		perm: newPermGateway(a.PermRegistry), budget: newContextBudget(),
 		phase: "act", trackEdits: true, existing: &p,
 	}
