@@ -175,14 +175,19 @@ if [ -n "$PID" ]; then
   BV=$(json_get "$BEFORE" version)
   BS=$(json_get "$BEFORE" status)
   ok "基线核对: status=$BS v=$BV"
-  # 新一轮 refine（构建型修改）走 SSE；1.5 秒后从流中提取 runId 调正式 cancel 接口
+  # 新一轮 refine（构建型修改）走 SSE；循环轮询 SSE 流提取 runId（live 模式 LLM
+  # 首 token 延迟数秒，1.5s 固定等待会扑空），抓到即调正式 cancel 接口
   rm -f /tmp/e2e-stop.txt
   ( curl -sk -N --max-time 90 -X POST "$BASE/api/projects/$PID/refine" \
       -H "Authorization: Bearer $TAcc" -H 'Content-Type: application/json' \
       -d '{"instruction":"把页面改成深蓝夜间主题"}' > /tmp/e2e-stop.txt 2>&1 ) &
   STUB_PID=$!
-  sleep 1.5
-  RUN_ID=$(grep -o 'run-[0-9]*' /tmp/e2e-stop.txt | head -1)
+  RUN_ID=""
+  for i in $(seq 1 25); do
+    RUN_ID=$(grep -o 'run-[0-9]*' /tmp/e2e-stop.txt 2>/dev/null | head -1)
+    [ -n "$RUN_ID" ] && break
+    sleep 1
+  done
   if [ -n "$RUN_ID" ]; then
     say "捕获 runId=$RUN_ID，调用正式停止接口"
     CANCEL_CODE=$(curl -sk -o /dev/null -w '%{http_code}' -X POST "$BASE/api/runs/$RUN_ID/cancel" -H "Authorization: Bearer $TAcc")
@@ -195,10 +200,11 @@ if [ -n "$PID" ]; then
       bad "停止接口异常（$CANCEL_CODE）"
     fi
   else
-    say "（未捕获 runId——构建太快已结束，改为直接断开连接）"
+    say "（25 秒内未捕获 runId，直接断开连接）"
     kill $STUB_PID 2>/dev/null
   fi
-  sleep 3
+  # live 模式 cancel 后任务收尾需要数秒（ctx 取消 → 落库），等待后核对终态
+  sleep 8
   AFTER=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID")
   AV=$(json_get "$AFTER" version)
   AS=$(json_get "$AFTER" status)
