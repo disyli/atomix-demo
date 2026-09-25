@@ -51,9 +51,6 @@ TS=$($CURL -X POST "$BASE/api/auth/guest"); TSnk=$(json_get "$TS" token)
 
 # 2.1 计算器
 say "构建计算器…"
-$CURL -X POST "$BASE/api/projects/$CalPid/refine" -H "Authorization: Bearer $TCal" >/dev/null 2>&1  # warm
-R1=$($CURL -X POST "$BASE/api/chat" -H "Authorization: Bearer $TCal" -H 'Content-Type: application/json' -d '{"message":"做一个计算器","mode":"build","projectId":0}')
-BRIEF1=$(json_get "$R1" brief)
 GEN1=$($CURL -G "$BASE/api/generate" --data-urlencode "brief=做一个极简计算器，支持四则运算" --data-urlencode "mode=build" --data-urlencode "t=$TCal")
 CAL_ID=$(echo "$GEN1" | tail -1 | grep -o '"id":[0-9]*' | head -1 | sed 's/.*://')
 [ -z "$CAL_ID" ] && CAL_ID=$(json_get "$GEN1" id)
