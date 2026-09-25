@@ -42,20 +42,30 @@ func (b *contextBudget) maybeCompress(messages *[]llm.ChatMessage) bool {
 		return false
 	}
 
-	// 定位配对边界：从「最近 keepRecent 条」往前找，确保不把 assistant(tool_calls)
-	// 与其配对的 tool 消息拆开。切点必须落在 user 或无 tool_calls 的 assistant 上。
+	// 动态识别消息头部：system 之后连续的 user 消息（初始需求 / 附件 / 研究简报）全部保留。
+	// 头部必须终止在第一条 assistant(tool_calls) 之前——build 模式没有初始 user 消息
+	// （需求已并入 system prompt），若沿用固定下标会把首条 assistant(tool_calls) 强行留在
+	// 头部，其配对 tool 消息落入压缩区被丢弃，产生孤儿 tool_calls，
+	// DeepSeek 会拒绝整个请求（insufficient tool messages following tool_calls message）。
+	head := 1
+	for head < len(msgs) && msgs[head].Role == "user" {
+		head++
+	}
+
+	// 定位配对边界：从「最近 keepRecent 条」往前回退，确保切点不落在 tool 消息上
+	// （tool 的 assistant(tool_calls) 会留在压缩区，形成孤儿 tool_calls）。
 	cut := len(msgs) - keepRecent
-	for cut > 2 && !boundaryOK(msgs, cut) {
+	for cut > head && !boundaryOK(msgs, cut) {
 		cut--
 	}
-	if cut <= 2 {
+	if cut <= head {
 		return false
 	}
 
 	// 收集压缩区信息：产物规模、已执行的关键动作、最近一次校验状态
 	var planText, lastObserve string
 	writes := 0
-	for _, m := range msgs[2:cut] {
+	for _, m := range msgs[head:cut] {
 		for _, tc := range m.ToolCalls {
 			switch tc.Function.Name {
 			case "plan_app":
@@ -78,25 +88,23 @@ func (b *contextBudget) maybeCompress(messages *[]llm.ChatMessage) bool {
 		truncateText(planText, 200), writes, truncateText(lastObserve, 300),
 	)
 
-	compressed := []llm.ChatMessage{msgs[0], msgs[1], {Role: "user", Content: summary}}
+	compressed := []llm.ChatMessage{}
+	compressed = append(compressed, msgs[:head]...)
+	compressed = append(compressed, llm.ChatMessage{Role: "user", Content: summary})
 	compressed = append(compressed, msgs[cut:]...)
 	*messages = compressed
 	return true
 }
 
 // boundaryOK 判断 msgs[cut:] 开头是否是安全的切分边界（不会拆开 tool_calls/tool 配对）。
+// 切点落在 assistant(tool_calls) 上是安全的：其配对 tool 消息必然在切点之后（tool
+// 永远在 assistant 之后追加进历史），整组随尾部区保留。唯一不安全的切点是 tool 消息
+// —— 它的 assistant(tool_calls) 会留在压缩区被丢弃，形成孤儿 tool_calls。
 func boundaryOK(msgs []llm.ChatMessage, cut int) bool {
 	if cut >= len(msgs) {
 		return false
 	}
-	switch msgs[cut].Role {
-	case "tool":
-		return false // tool 消息必须紧跟其 assistant(tool_calls)，不能作切点
-	case "assistant":
-		return len(msgs[cut].ToolCalls) == 0
-	default:
-		return true
-	}
+	return msgs[cut].Role != "tool"
 }
 
 // clampObserve 控制单条观察回喂长度。
