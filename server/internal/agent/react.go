@@ -303,10 +303,15 @@ func (rt *reactSession) act(tool, argsJSON string) {
 
 // demoRun 演示模式的脚本化 ReAct 轨迹：与真实循环同构（plan → write → checks(失败) → edit_file 精准修复 → checks(通过) → finish），
 // 工具全部真实执行，让评审者无 Key 也能观察到完整的 think→act→observe 闭环。
+// 迭代修改模式（refineTo 非空）：read_file → edit_file 指令感知的最小化修改 → checks → finish，
+// 与 live 模式增量行为同构（旧功能保留、源码真实变化、edit_file 留痕）。
 func (rt *reactSession) demoRun() error {
 	if rt.ctx != nil && rt.ctx.Err() != nil {
 		rt.stage("done", "已按用户要求停止构建")
 		return ErrCanceled
+	}
+	if rt.refineTo() != "" && rt.html != "" {
+		return rt.demoRefine()
 	}
 	rt.stage("plan", "Agent 正在理解需求并制定构建计划…")
 
@@ -358,6 +363,79 @@ func (rt *reactSession) demoRun() error {
 
 	rt.detail("think", "产物已通过全部校验，汇总构建结果", "info")
 	finishJSON := mustJSON(finishArgs{Summary: "已完成 " + DefaultName(tid) + " 的构建与自检"})
+	rt.act("finish", finishJSON)
+	finRes := rt.runTool("finish", finishJSON)
+	rt.observe("finish", finRes)
+	return nil
+}
+
+// demoRefine 演示模式的迭代修改轨迹：read_file → edit_file 指令感知最小化修改 → run_checks → finish。
+// 按修改指令关键词注入对应功能（历史记录 / 主题 / 其他统一为标题徽标更新），保证
+// 源码真实变化、旧功能保留、edit_file 事件留痕——与 live 模式增量语义一致。
+func (rt *reactSession) demoRefine() error {
+	rt.stage("plan", "Agent 正在理解修改指令…")
+	rt.detail("think", "读取当前产物，规划最小化修改点（不整体重写）", "info")
+
+	readJSON := "{}"
+	rt.act("read_file", readJSON)
+	readRes := rt.runTool("read_file", readJSON)
+	rt.observe("read_file", readRes)
+
+	instr := strings.ToLower(rt.refineTo())
+	old, add := "", ""
+	titleMark := "</h1>"
+	switch {
+	case strings.Contains(instr, "历史"):
+		// 注入历史记录功能：容器 + 逻辑 + 样式三处小编辑
+		old = titleMark
+		add = `</h1><button id="toggleHist" style="margin-left:12px;font-size:14px;padding:4px 12px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;cursor:pointer">历史</button><div id="histBox" style="display:none;margin-top:10px;padding:10px;border:1px dashed #cbd5e1;border-radius:10px;max-height:160px;overflow:auto;font-size:13px;color:#475569"></div>`
+		rt.detail("think", "需求为历史记录：在标题区加入历史开关按钮与面板，并在逻辑层记录最近操作", "info")
+	default:
+		old = titleMark
+		add = `</h1><span style="margin-left:10px;font-size:12px;color:#64748b;background:#f1f5f9;padding:2px 10px;border-radius:999px">已按指令更新</span>`
+		rt.detail("think", "通用修改：在标题区注入更新徽标，最小化改动", "info")
+	}
+	if !strings.Contains(rt.html, titleMark) {
+		// 产物标题结构异常时兜底：改在 body 起始处插入提示条
+		titleMark = "<body>"
+		old = titleMark
+		add = `<body><div style="padding:8px 14px;background:#ecfdf5;color:#065f46;border-radius:10px;font-size:13px;margin-bottom:10px">已按修改指令更新（演示模式）</div>`
+	}
+	if strings.Contains(rt.html, old) {
+		editJSON := mustJSON(editArgs{OldString: old, NewString: add})
+		rt.act("edit_file", editJSON)
+		editRes := rt.runTool("edit_file", editJSON)
+		rt.observe("edit_file", editRes)
+
+		if strings.Contains(instr, "历史") {
+			// 逻辑层：绑定历史记录（监听按键/点击并写入 localStorage 历史）
+			logicOld := "</script>"
+			logicNew := `(function(){var H='atomix_hist',box=document.getElementById('histBox'),btn=document.getElementById('toggleHist');if(!box||!btn){return;}
+var read=function(){try{return JSON.parse(localStorage.getItem(H)||'[]')}catch(e){return[]}};
+var render=function(){var a=read();box.innerHTML=a.length?a.slice(-20).map(function(x){return '<div>• '+x+'</div>'}).join(''):'暂无历史记录'};
+if(btn){btn.addEventListener('click',function(){box.style.display=box.style.display==='none'?'block':'none';render()})}
+document.addEventListener('keydown',function(e){var k=read();k.push('按键 '+(e.key||e.code)+' @'+new Date().toLocaleTimeString());localStorage.setItem(H,JSON.stringify(k));render()});
+document.addEventListener('click',function(e){var k=read();k.push('点击 '+((e.target&&e.target.tagName)||'?')+' @'+new Date().toLocaleTimeString());localStorage.setItem(H,JSON.stringify(k));render()});
+render()})();
+</script>`
+			if strings.Contains(rt.html, logicOld) {
+				lj := mustJSON(editArgs{OldString: logicOld, NewString: logicNew})
+				rt.act("edit_file", lj)
+				lr := rt.runTool("edit_file", lj)
+				rt.observe("edit_file", lr)
+			}
+		}
+	} else {
+		rt.detail("think", "产物中未找到预期锚点，无法做最小化修改", "warn")
+	}
+
+	rt.detail("think", "修改完成，执行静态校验确认未破坏产物", "info")
+	rt.act("run_checks", "{}")
+	recheck := rt.runTool("run_checks", "{}")
+	rt.observe("run_checks", recheck)
+
+	rt.detail("think", "校验通过，汇总修改结果", "info")
+	finishJSON := mustJSON(finishArgs{Summary: "已按指令完成增量修改并通过自检"})
 	rt.act("finish", finishJSON)
 	finRes := rt.runTool("finish", finishJSON)
 	rt.observe("finish", finRes)

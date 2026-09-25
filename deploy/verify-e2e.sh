@@ -22,6 +22,20 @@ section() { echo; echo -e "\e[1;35m════ $* ════\e[0m"; }
 # json_get <json> <key>（一层取值，够用）
 json_get() { echo "$1" | grep -o "\"$2\"[[:space:]]*:[[:space:]]*[^,}]*" | head -1 | sed "s/.*:[[:space:]]*//; s/\"//g"; }
 
+# json_str <json> <key>: 用 python 做转义感知的字符串字段提取（json_get 处理含逗号/
+# 转义内容的 HTML 字段会在首个逗号截断且剥引号破坏内容，凡取大文本字段必须用这个）。
+json_str() {
+  printf '%s' "$1" | python3 -c '
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    v = d.get(sys.argv[1], "") if isinstance(d, dict) else ""
+    sys.stdout.write(v if isinstance(v, str) else json.dumps(v, ensure_ascii=False))
+except Exception:
+    pass
+' "$2"
+}
+
 # ---------- 权限自动批准守护 ----------
 # live 模式 write_file/edit_file 为 ask 级权限，SSE 会推 permission 事件；
 # 脚本无人值守必须自动批准（allow_session：同工具本次构建全放行）。
@@ -109,7 +123,7 @@ if [ -n "$SNK_ID" ] && [ "$SNK_ID" != "0" ]; then ok "贪吃蛇项目已创建 (
 if [ -n "$CAL_ID" ] && [ -n "$SNK_ID" ]; then
   SRC1=$($CURL -H "Authorization: Bearer $TCal" "$BASE/api/projects/$CAL_ID/source")
   SRC2=$($CURL -H "Authorization: Bearer $TSnk" "$BASE/api/projects/$SNK_ID/source")
-  S1=$(json_get "$SRC1" source); S2=$(json_get "$SRC2" source)
+  S1=$(json_str "$SRC1" source); S2=$(json_str "$SRC2" source)
   if echo "$S1" | grep -qi "calc\|计算"; then ok "计算器源码含计算器特征"; else bad "计算器源码无特征"; fi
   if echo "$S2" | grep -qi "snake\|贪吃蛇\|canvas"; then ok "贪吃蛇源码含游戏特征"; else bad "贪吃蛇源码无特征"; fi
   if [ "$S1" != "$S2" ] && [ -n "$S1" ] && [ -n "$S2" ]; then ok "两类 Prompt 源码不同（独立产物）"; else bad "两类 Prompt 源码相同（串模板）"; fi
@@ -142,7 +156,7 @@ if [ -z "$PID" ] || [ "$PID" = "0" ]; then bad "增量基线项目构建失败: 
   VER=$(json_get "$PROJ" version)
   if [ "$VER" -ge 2 ] 2>/dev/null; then ok "两轮后版本号 v$VER（递增）"; else bad "版本未递增: v$VER"; fi
   SRC_B=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/source")
-  S_A=$(json_get "$SRC_A" source); S_B=$(json_get "$SRC_B" source)
+  S_A=$(json_str "$SRC_A" source); S_B=$(json_str "$SRC_B" source)
   if [ "$S_A" != "$S_B" ] && [ -n "$S_B" ]; then ok "两轮源码存在差异（真实增量）"; else bad "两轮源码无差异"; fi
   EV2=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/events")
   if echo "$EV2" | grep -q "edit_file"; then ok "增量轮走 edit_file 精准修改"; else say "（demo 模式下增量可能整体重写，跳过 edit_file 断言）"; fi
@@ -155,27 +169,37 @@ fi
 
 section "4. 失败落库与最后成功版本保留"
 if [ -n "$PID" ]; then
-  # 真实触发一轮「未完成」：发起第三轮 refine 后立即取消（stop），
-  # 状态机必须落库 stopped 而非卡在 generating，且产物保留最后成功版本  BEFORE=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID")
+  # 真实触发一轮「未完成」：发起增量后 3 秒断开 SSE 连接（客户端取消 → 服务端 ctx
+  # 取消），状态机必须落库 stopped/合法终态且产物保留最后成功版本。
+  BEFORE=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID")
   BV=$(json_get "$BEFORE" version)
   BS=$(json_get "$BEFORE" status)
   ok "基线核对: status=$BS v=$BV"
-  ENC4=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "把整个页面重构成金色主题并加更多动画")
-  ( curl -sk -N --max-time 60 "$BASE/api/generate?brief=$ENC4&mode=build&t=$TAcc" >/dev/null 2>&1 ) &
+  # 新一轮 refine（构建型修改）走 SSE；1.5 秒后从流中提取 runId 调正式 cancel 接口
+  rm -f /tmp/e2e-stop.txt
+  ( curl -sk -N --max-time 90 -X POST "$BASE/api/projects/$PID/refine" \
+      -H "Authorization: Bearer $TAcc" -H 'Content-Type: application/json' \
+      -d '{"instruction":"把页面改成深蓝夜间主题"}' > /tmp/e2e-stop.txt 2>&1 ) &
   STUB_PID=$!
+  sleep 1.5
+  RUN_ID=$(grep -o 'run-[0-9]*' /tmp/e2e-stop.txt | head -1)
+  if [ -n "$RUN_ID" ]; then
+    say "捕获 runId=$RUN_ID，调用正式停止接口"
+    CANCEL_CODE=$(curl -sk -o /dev/null -w '%{http_code}' -X POST "$BASE/api/runs/$RUN_ID/cancel" -H "Authorization: Bearer $TAcc")
+    if [ "$CANCEL_CODE" = "200" ]; then ok "停止接口受理（200）"; else bad "停止接口异常（$CANCEL_CODE）"; fi
+  else
+    say "（未捕获 runId——demo 模式构建太快已结束，改为直接断开连接）"
+    kill $STUB_PID 2>/dev/null
+  fi
   sleep 3
-  RUNS=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/runs/active" 2>/dev/null || echo "")
-  # 直接停当前活跃项目的进行中任务：取消接口需要 runId，改用项目维度等待 generating 出现后取消最近 run
-  # 简化：睡 3 秒后立刻取消（runId 经 /api/runs/active 不可用时跳过，仅核对项目行状态）
-  sleep 3
-  kill $STUB_PID 2>/dev/null
   AFTER=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID")
   AV=$(json_get "$AFTER" version)
   AS=$(json_get "$AFTER" status)
   # stopped/ready 都属合法终态：关键是不能永远 generating，且 version 不回退
   if [ "$AS" = "stopped" ] || [ "$AS" = "ready" ]; then ok "中断轮落到合法终态（$AS），version=$AV 未回退"; else bad "中断后状态异常: $AS v=$AV"; fi
   SRC_KEEP=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/source")
-  if [ -n "$(json_get "$SRC_KEEP" source)" ]; then ok "失败/中断后源码保留（最后成功版本）"; else bad "源码丢失"; fi
+  KEEP_S=$(json_str "$SRC_KEEP" source)
+  if [ -n "$KEEP_S" ]; then ok "失败/中断后源码保留（最后成功版本）"; else bad "源码丢失"; fi
   PV_KEEP=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/preview")
   if [ -n "$PV_KEEP" ]; then ok "失败/中断后预览仍可用"; else bad "预览丢失"; fi
 else
@@ -186,17 +210,24 @@ section "5. 版本快照与回滚原子性"
 if [ -n "$PID" ]; then
   SNAPS=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/snapshots")
   CNT=$(echo "$SNAPS" | grep -o '"version":' | wc -l)
-  if [ "$CNT" -ge 3 ]; then ok "快照列表 $CNT 条（含回滚快照）"; else bad "快照不足: $CNT 条"; fi
-  # 回滚后源码 = v1 快照内容（预览与源码原子一致）
+  if [ "$CNT" -ge 2 ]; then ok "快照列表 $CNT 条（每轮构建各一条）"; else bad "快照不足: $CNT 条"; fi
+  # 记录回滚前的 v2 源码指纹，回滚到 v1 后源码必须变化且恢复计算器 v1 特征
+  SRC_V2=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/source")
+  S_V2=$(json_str "$SRC_V2" source)
+  RB_RESP=$($CURL -X POST "$BASE/api/projects/$PID/rollback" -H "Authorization: Bearer $TAcc" -H 'Content-Type: application/json' -d '{"version":1}')
+  RB_VER=$(json_str "$RB_RESP" rollbackTo)
+  if [ "$RB_VER" = "1" ]; then ok "回滚到 v1 接口受理（rollbackTo=$RB_VER）"; else bad "回滚响应异常: $(tail -c 200 <<<"$RB_RESP")"; fi
   SRC_C=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/source")
-  SC=$(json_get "$SRC_C" source)
+  SC=$(json_str "$SRC_C" source)
   PV_C=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/preview")
-  if [ -n "$SC" ] && [ "$PV_C" != "$SC" ]; then
-    # preview 接口返回完整 HTML 文档，与 source 的差异仅允许 shim 注入
+  if [ -n "$SC" ] && [ -n "$PV_C" ]; then
     ok "回滚后源码与预览均返回内容（原子切换）"
+  else
+    bad "回滚后源码或预览为空"
   fi
+  if [ -n "$SC" ] && [ "$SC" != "$S_V2" ]; then ok "回滚后源码切实变化（v2 → v1）"; else bad "回滚后源码未变化（回滚无效）"; fi
   if echo "$SC" | grep -qi "calc\|计算"; then ok "回滚后源码为 v1 计算器内容"; else bad "回滚内容异常"; fi
-  # 回滚到不存在版本必须 400/报错
+  # 回滚到不存在版本必须拒绝（400/409）
   RB=$(curl -sk -o /dev/null -w '%{http_code}' -X POST "$BASE/api/projects/$PID/rollback" -H "Authorization: Bearer $TAcc" -H 'Content-Type: application/json' -d '{"version":999}')
   if [ "$RB" != "200" ]; then ok "回滚不存在版本被拒绝（$RB）"; else bad "回滚不存在版本返回 200"; fi
 else
@@ -226,13 +257,18 @@ else
 fi
 
 section "8. 登录页游客入口（静态资源）"
-LOGIN_HTML=$($CURL "$BASE/login")
 APP_JS=$($CURL "$BASE/" | grep -o 'assets/index-[^"]*\.js' | head -1)
 if [ -n "$APP_JS" ]; then ok "前端资源已就绪: $APP_JS"; else bad "前端入口异常"; fi
-# SPA 的 index.html 是空壳，游客入口按钮在 JS bundle 里
-JS_BODY=$($CURL "$BASE/$APP_JS")
-if echo "$JS_BODY" | grep -q "auth/guest"; then ok "游客入口已包含在前端代码中（auth/guest 调用存在）"; else bad "JS bundle 未发现游客登录调用"; fi
-if echo "$JS_BODY" | grep -q "游客"; then ok "游客入口按钮文案已包含在前端代码中"; else say "（bundle 压缩可能改变中文文案，仅作参考）"; fi
+# SPA 懒加载：guest 按钮与 auth/guest 调用在 LoginView chunk 中，文件名映射藏在 index bundle 里
+INDEX_BODY=$($CURL "$BASE/$APP_JS")
+LOGIN_CHUNK=$(echo "$INDEX_BODY" | grep -o 'LoginView-[A-Za-z0-9_-]*\.js' | head -1)
+if [ -n "$LOGIN_CHUNK" ]; then
+  LOGIN_BODY=$($CURL "$BASE/assets/$LOGIN_CHUNK")
+  if echo "$LOGIN_BODY" | grep -q "auth/guest"; then ok "游客入口已包含在前端代码中（$LOGIN_CHUNK 含 auth/guest 调用）"; else bad "LoginView chunk 未发现游客登录调用"; fi
+  if echo "$LOGIN_BODY" | grep -q "游客"; then ok "游客入口按钮文案已包含在前端代码中"; else bad "LoginView chunk 未发现游客文案"; fi
+else
+  if echo "$INDEX_BODY" | grep -q "auth/guest"; then ok "游客入口已包含在前端代码中（index bundle 内联）"; else bad "未能定位 LoginView chunk 且 index bundle 无 auth/guest"; fi
+fi
 
 echo
 echo -e "\e[1m══════════ 汇总 ══════════\e[0m"
