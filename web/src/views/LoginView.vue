@@ -29,6 +29,22 @@ async function submit() {
     loading.value = false
   }
 }
+
+// 游客一键登录：无需注册和个人 API Key，即时创建一次性游客账号
+async function guestLogin() {
+  error.value = ''
+  loading.value = true
+  try {
+    const data = await api.guestLogin()
+    localStorage.setItem('atomix_token', data.token)
+    localStorage.setItem('atomix_user', JSON.stringify(data.user))
+    router.push('/dashboard')
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    loading.value = false
+  }
+}
 </script>
 
 <template>
@@ -63,6 +79,15 @@ async function submit() {
             {{ loading ? '请稍候…' : (mode === 'login' ? '开始' : '创建账号并开始') }}
           </button>
         </form>
+
+        <!-- 游客入口：评审者无需注册账号、无需 API Key -->
+        <div class="guest-zone">
+          <div class="divider"><span>评审无需账号</span></div>
+          <button class="guest-btn" :disabled="loading" @click="guestLogin">
+            🚀 以游客身份进入演示
+          </button>
+          <p class="guest-tip">即时创建一次性游客会话，可完整体验 Agent 构建全流程（演示模式）</p>
+        </div>
 
         <p class="hint">数据持久化于服务端 SQLite · 首次使用请先注册</p>
       </div>
@@ -229,6 +254,33 @@ input:focus {
   padding: 10px 14px;
 }
 .hint { margin-top: 20px; color: var(--ink-30); font-size: 12px; font-family: var(--font-mono); }
+
+/* ---- 游客入口 ---- */
+.guest-zone { margin-top: 18px; }
+.divider {
+  display: flex; align-items: center; gap: 12px;
+  color: var(--ink-30); font-size: 12px;
+  margin-bottom: 14px;
+}
+.divider::before, .divider::after {
+  content: ""; flex: 1; height: 1px; background: var(--line);
+}
+.guest-btn {
+  width: 100%;
+  background: transparent;
+  color: var(--teal-500);
+  border: 1.5px dashed var(--teal-500);
+  border-radius: 10px;
+  padding: 13px;
+  font-size: 14.5px;
+  font-weight: 700;
+  letter-spacing: .01em;
+  transition: background .18s ease, color .18s ease, transform .12s ease;
+}
+.guest-btn:hover:not(:disabled) { background: var(--teal-500); color: var(--paper-50); }
+.guest-btn:active:not(:disabled) { transform: scale(.985); }
+.guest-btn:disabled { opacity: .5; cursor: default; }
+.guest-tip { margin-top: 10px; color: var(--ink-30); font-size: 11.5px; line-height: 1.6; }
 
 /* ---- 手稿标注装饰 ---- */
 .aside-notes { position: absolute; right: 6%; top: 22%; display: flex; flex-direction: column; gap: 12px; }

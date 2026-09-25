@@ -518,6 +518,7 @@ function setActiveProject(p) {
   previewUrl.value = api.previewUrl(p.id, readAppData(p.id))
   rightTab.value = 'preview'
   codeView.value = { loading: false, name: '', filename: '', source: '', lines: 0, size: 0, copied: false }
+  versionView.value = { loading: false, current: p.version || 0, snapshots: [], rolling: 0, notice: '' }
   try { sessionStorage.setItem('atomix_last_project', String(p.id)) } catch {}
 }
 
@@ -535,6 +536,51 @@ async function loadSource() {
 
 // 首次切到「源代码」tab 时懒加载源码（此后构建/迭代完成会重置 codeView，再切会重新拉取）
 watch(rightTab, (v) => { if (v === 'code' && !codeView.value.source && activeProject.value && !codeView.value.loading) loadSource() })
+
+/* ---------- 版本管理（快照列表 + 回滚） ---------- */
+const versionView = ref({ loading: false, current: 0, snapshots: [], rolling: 0, notice: '' })
+
+// 拉取当前项目的成功版本快照列表（version DESC）
+async function loadSnapshots() {
+  if (!activeProject.value) return
+  versionView.value.loading = true
+  try {
+    const d = await api.getSnapshots(activeProject.value.id)
+    versionView.value = { loading: false, current: d.current || 0, snapshots: d.snapshots || [], rolling: 0, notice: '' }
+  } catch (e) {
+    versionView.value = { loading: false, current: activeProject.value.version || 0, snapshots: [], rolling: 0, notice: '快照加载失败：' + e.message }
+  }
+}
+
+// 首次切到「版本」tab 时懒加载快照；构建/迭代/回滚后重置再切会重新拉取
+watch(rightTab, (v) => { if (v === 'version' && !versionView.value.snapshots.length && activeProject.value && !versionView.value.loading) loadSnapshots() })
+
+// 回滚到指定成功版本：服务端事务保证「源码 / 预览 / 版本号」原子一致，
+// 回滚成功后本地同步刷新预览 iframe、源码面板、快照列表与项目列表
+async function rollbackTo(snap) {
+  if (!activeProject.value || !snap || snap.current || versionView.value.rolling) return
+  if (!confirm('确定回滚到 v' + snap.version + '？当前预览与源码将立即切换为该版本内容。')) return
+  versionView.value.rolling = snap.version
+  versionView.value.notice = ''
+  try {
+    const d = await api.rollback(activeProject.value.id, snap.version)
+    // 原子刷新：预览 URL 重置（iframe 重载）+ 源码缓存重置（再切重拉）+ 项目行替换
+    setActiveProject(d.project)
+    codeView.value = { loading: false, name: '', filename: '', source: '', lines: 0, size: 0, copied: false }
+    rightTab.value = 'preview'
+    await loadSnapshots()
+    loadProjects()
+    versionView.value.notice = '已回滚至 v' + snap.version + '（当前 v' + d.project.version + '），预览与源码已同步更新'
+  } catch (e) {
+    versionView.value.notice = '回滚失败：' + e.message
+  } finally {
+    versionView.value.rolling = 0
+  }
+}
+
+function snapTime(ms) {
+  try { return new Date(ms).toLocaleString() } catch { return '' }
+}
 
 async function copySource() {
   if (!codeView.value.source) return
@@ -639,6 +685,7 @@ function newChat() {
   previewUrl.value = ''
   rightTab.value = 'preview'
   codeView.value = { loading: false, name: '', filename: '', source: '', lines: 0, size: 0, copied: false }
+  versionView.value = { loading: false, current: 0, snapshots: [], rolling: 0, notice: '' }
   composer.value = ''
   try { sessionStorage.removeItem('atomix_last_project') } catch {}
 }
@@ -867,6 +914,9 @@ onBeforeUnmount(() => {
         <div class="tabs">
           <button :class="{ active: rightTab === 'preview' }" @click="rightTab = 'preview'">应用预览</button>
           <button :class="{ active: rightTab === 'code' }" @click="rightTab = 'code'">源代码</button>
+          <button :class="{ active: rightTab === 'version' }" @click="rightTab = 'version'">
+            版本<span v-if="activeProject && activeProject.version" class="ver-badge">v{{ activeProject.version }}</span>
+          </button>
           <button :class="{ active: rightTab === 'history' }" @click="rightTab = 'history'">
             历史项目 <span class="count">{{ projects.length }}</span>
           </button>
@@ -921,6 +971,43 @@ onBeforeUnmount(() => {
               <div class="code-gutter">{{ codeLines.map((_, i) => i + 1).join('\n') }}</div>
               <pre class="code-pre"><code v-html="highlightHTML(codeView.source)"></code></pre>
             </div>
+          </template>
+        </div>
+
+        <div v-show="rightTab === 'version'" class="version-wrap">
+          <div v-if="!activeProject" class="empty-tip big">
+            <div class="big-mono">// no versions</div>
+            还没有可管理的版本
+            <span>应用通过校验并落库后，每个成功版本都会自动生成快照</span>
+          </div>
+          <template v-else>
+            <div class="ver-head">
+              <b>{{ activeProject.name }}</b>
+              <span class="meta">当前 v{{ versionView.current || activeProject.version || 0 }} · {{ versionView.snapshots.length }} 个成功版本</span>
+              <span class="flex-spacer"></span>
+              <button class="code-act" :disabled="versionView.loading" @click="loadSnapshots">刷新</button>
+            </div>
+            <div v-if="versionView.notice" class="ver-notice" :class="{ err: versionView.notice.startsWith('回滚失败') || versionView.notice.startsWith('快照加载失败') }">{{ versionView.notice }}</div>
+            <div v-if="versionView.loading" class="code-loading">正在读取版本快照…</div>
+            <div v-else-if="!versionView.snapshots.length" class="code-loading">该项目还没有成功版本（构建通过校验后会自动产生快照）</div>
+            <div v-else class="ver-list">
+              <div v-for="s in versionView.snapshots" :key="s.id" class="ver-item" :class="{ current: s.current }">
+                <div class="ver-main">
+                  <div class="ver-top">
+                    <span class="ver-no">v{{ s.version }}</span>
+                    <span v-if="s.current" class="ver-now">当前</span>
+                    <span class="ver-label">{{ s.label }}</span>
+                  </div>
+                  <div class="ver-time">{{ snapTime(s.createdAt) }}</div>
+                </div>
+                <button
+                  class="ver-rollback"
+                  :disabled="s.current || versionView.rolling"
+                  @click="rollbackTo(s)"
+                >{{ s.current ? '—' : (versionView.rolling === s.version ? '回滚中…' : '回滚到此版本') }}</button>
+              </div>
+            </div>
+            <div class="ver-foot">回滚为原子操作：源码、预览与版本号同时切换到目标版本，回滚本身也会生成新版本快照</div>
           </template>
         </div>
 
@@ -1299,5 +1386,56 @@ onBeforeUnmount(() => {
   background: var(--teal-50); color: var(--teal-600);
   padding: 2px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;
   font-family: var(--font-sans);
+}
+
+/* ============ 版本管理面板 ============ */
+.version-wrap { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow-y: auto; }
+.ver-badge {
+  display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 6px;
+  background: var(--teal-50); color: var(--teal-600);
+  font-size: 10.5px; font-weight: 700; font-family: var(--font-mono);
+}
+.ver-head {
+  display: flex; align-items: center; gap: 10px; padding: 13px 18px;
+  border-bottom: 1px solid var(--line-soft); font-size: 14.5px;
+}
+.ver-head .meta { color: var(--ink-30); font-size: 12px; font-family: var(--font-mono); }
+.ver-notice {
+  margin: 12px 18px 0; padding: 10px 14px; border-radius: 8px;
+  background: var(--teal-50); color: var(--teal-600); font-size: 12.5px; line-height: 1.6;
+}
+.ver-notice.err { background: rgba(193, 74, 80, .08); color: var(--red); border: 1px solid rgba(193, 74, 80, .22); }
+.ver-list { flex: 1; padding: 6px 0 20px; }
+.ver-item {
+  display: flex; align-items: center; gap: 14px;
+  padding: 14px 18px; border-bottom: 1px solid var(--line-soft);
+  transition: background .15s ease;
+}
+.ver-item:hover { background: var(--paper-100); }
+.ver-item.current { background: var(--indigo-50); box-shadow: inset 3px 0 0 var(--indigo-500); }
+.ver-main { flex: 1; min-width: 0; }
+.ver-top { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+.ver-no {
+  font-family: var(--font-mono); font-weight: 700; font-size: 13px; color: var(--indigo-600);
+}
+.ver-now {
+  background: var(--indigo-500); color: var(--paper-50);
+  font-size: 10.5px; font-weight: 700; padding: 1px 8px; border-radius: 6px;
+}
+.ver-label {
+  color: var(--ink-80); font-size: 13px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ver-time { color: var(--ink-30); font-size: 11.5px; font-family: var(--font-mono); }
+.ver-rollback {
+  flex: none; color: var(--indigo-500); font-size: 12.5px; font-weight: 600;
+  border: 1px solid rgba(61, 79, 196, .3); border-radius: 8px;
+  padding: 7px 14px; transition: all .18s ease; background: var(--paper-50);
+}
+.ver-rollback:hover:not(:disabled) { background: var(--indigo-50); border-color: var(--indigo-500); }
+.ver-rollback:disabled { opacity: .4; cursor: not-allowed; }
+.ver-foot {
+  padding: 12px 18px 16px; color: var(--ink-30); font-size: 11.5px;
+  font-family: var(--font-mono); line-height: 1.6; border-top: 1px solid var(--line-soft);
 }
 </style>

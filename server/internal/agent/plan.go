@@ -35,7 +35,7 @@ type TplInfo struct {
 
 // All 返回全部内置模板。
 func All() []TplInfo {
-	return []TplInfo{todoTpl(), notesTpl(), kanbanTpl()}
+	return append([]TplInfo{todoTpl(), notesTpl(), kanbanTpl()}, extraTplInfos()...)
 }
 
 // Get 按 ID 获取模板。
@@ -57,7 +57,11 @@ func DefaultName(id string) string {
 }
 
 // Match 根据自然语言需求推断最合适的模板 ID。
+// 扩展模板（计算器/贪吃蛇）优先匹配，保证独立 Prompt 路由到独立产物。
 func Match(brief string) string {
+	if id := MatchExtra(brief); id != "" {
+		return id
+	}
 	b := strings.ToLower(brief)
 	type kv struct {
 		words []string

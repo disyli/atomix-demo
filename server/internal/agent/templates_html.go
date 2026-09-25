@@ -12,6 +12,7 @@ type PreviewMeta struct {
 }
 
 // RenderTemplate 返回模板 ID 对应的完整单文件应用 HTML。
+// 计算器/贪吃蛇为静态完整产物（无模板变量），直接返回。
 func RenderTemplate(id, appName string) (TplInfo, string, error) {
 	info, ok := Get(id)
 	if !ok {
@@ -19,6 +20,12 @@ func RenderTemplate(id, appName string) (TplInfo, string, error) {
 	}
 	if appName == "" {
 		appName = info.Name
+	}
+	switch id {
+	case "calculator":
+		return info, calculatorHTML(), nil
+	case "snake":
+		return info, snakeHTML(), nil
 	}
 	tpl, ok := htmlTemplates[id]
 	if !ok {

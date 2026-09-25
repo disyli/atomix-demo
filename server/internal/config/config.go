@@ -16,7 +16,18 @@ type Config struct {
 	DeepSeekURL   string
 	DeepSeekModel string
 	UseMock       bool
+	// DeploySHA 部署版本标识（构建时经 -ldflags 注入，health 接口返回，评审可核对）
+	DeploySHA string
+	// GuestEnabled 游客入口开关（默认开启；评审无需注册个人账号即可体验）
+	GuestEnabled bool
 }
+
+// BuiltinDeploySHA 构建期经 -ldflags 注入的部署标识（Dockerfile 传入 git short SHA）。
+var BuiltinDeploySHA string
+
+// DefaultJWTSecret dev 兜底密钥：仅未配置环境变量时使用，生产部署必须显式覆盖
+// （main.go 会拒绝在 live 模式下使用该默认值启动）。
+const DefaultJWTSecret = "atomix-demo-dev-secret-please-change"
 
 func Load() (*Config, error) {
 	dir, err := os.Getwd()
@@ -33,10 +44,13 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		Port:          getEnvInt("ATOMIX_PORT", 51720),
 		DataDir:       dataDir,
-		JWTSecret:     getEnv("ATOMIX_JWT_SECRET", "atomix-demo-dev-secret-please-change"),
+		JWTSecret:     getEnv("ATOMIX_JWT_SECRET", DefaultJWTSecret),
 		DeepSeekKey:   os.Getenv("DEEPSEEK_API_KEY"),
 		DeepSeekURL:   getEnv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
 		DeepSeekModel: getEnv("DEEPSEEK_MODEL", "deepseek-v4-flash-vision-exp"),
+		// 部署标识：优先运行时环境变量（deploy.sh 注入），否则用构建期 ldflags 值
+		DeploySHA:     getEnv("ATOMIX_DEPLOY_SHA", firstNonEmpty(BuiltinDeploySHA, "dev-local")),
+		GuestEnabled:  getEnv("ATOMIX_GUEST_ENABLED", "1") == "1",
 	}
 	cfg.UseMock = cfg.DeepSeekKey == ""
 	return cfg, nil
@@ -47,6 +61,13 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 func getEnvInt(key string, def int) int {

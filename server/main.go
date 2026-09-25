@@ -19,6 +19,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	// 生产安全检查：接入真实 LLM（live 模式）时禁止使用默认 JWT 密钥，
+	// 防止默认密钥泄露导致的令牌伪造。dev/demo 模式放行（无真实数据风险）。
+	if !cfg.UseMock && cfg.JWTSecret == config.DefaultJWTSecret {
+		log.Fatal("安全检查失败：live 模式检测到默认 JWT 密钥，请设置 ATOMIX_JWT_SECRET 环境变量（至少 32 位随机字符串）后重启")
+	}
 	if err := store.Open(cfg.DataDir); err != nil {
 		log.Fatalf("open store: %v", err)
 	}

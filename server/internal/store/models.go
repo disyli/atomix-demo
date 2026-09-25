@@ -1,6 +1,10 @@
 package store
 
-import "gorm.io/gorm"
+import (
+	"fmt"
+
+	"gorm.io/gorm"
+)
 
 // User 用户表。
 type User struct {
@@ -22,6 +26,10 @@ type Project struct {
 	Template     string `gorm:"size:32" json:"template"`
 	HTML         string `gorm:"type:text" json:"-"`
 	Status       string `gorm:"size:16" json:"status"`
+	// Version 当前生效版本号：每次成功构建/迭代/回滚后 +1（与最新 Snapshot 对齐）
+	Version int `gorm:"not null;default:0" json:"version"`
+	// LastGoodHTML 最近一次通过校验并落库的产物（失败时保留的最后成功版本）
+	LastGoodHTML string `gorm:"type:text" json:"-"`
 	CreatedAtMs  int64  `json:"createdAt"`
 	UpdatedAtMs  int64  `json:"updatedAt"`
 }
@@ -68,6 +76,107 @@ type Attachment struct {
 }
 
 func (Attachment) TableName() string { return "attachments" }
+
+// Snapshot 一次成功构建/迭代的产物快照：版本回滚的真实数据源。
+// 每次产物通过校验并落库时创建（version 与 Project.Version 同步递增）。
+type Snapshot struct {
+	ID        uint   `gorm:"primaryKey" json:"id"`
+	ProjectID uint   `gorm:"index:idx_snap_proj_ver,unique" json:"projectId"`
+	Version   int    `gorm:"index:idx_snap_proj_ver,unique" json:"version"`
+	HTML      string `gorm:"type:text" json:"-"`
+	Label     string `gorm:"size:190" json:"label"` // 快照说明（首次构建 / 每轮迭代 / 回滚说明）
+	Status    string `gorm:"size:16" json:"status"` // done（成功版本才有快照）
+	CreatedAtMs int64  `json:"createdAt"`
+}
+
+func (Snapshot) TableName() string { return "snapshots" }
+
+// CreateSnapshot 事务内创建版本快照：Project.Version 递增 + Snapshot 写入，
+// 保证「版本号 → 快照内容」原子一致（并发下同 project 版本唯一索引防重）。
+func CreateSnapshot(projectID uint, html, label string) (*Snapshot, error) {
+	var out *Snapshot
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var p Project
+		if err := tx.Where("id = ?", projectID).First(&p).Error; err != nil {
+			return err
+		}
+		now := Now()
+		nextVer := p.Version + 1
+		if err := tx.Model(&Project{}).Where("id = ?", projectID).
+			Updates(map[string]interface{}{"version": nextVer, "html": html, "last_good_html": html, "status": "ready", "updated_at_ms": now}).Error; err != nil {
+			return err
+		}
+		s := &Snapshot{ProjectID: projectID, Version: nextVer, HTML: html, Label: label, Status: "done", CreatedAtMs: now}
+		if err := tx.Create(s).Error; err != nil {
+			return err
+		}
+		out = s
+		return nil
+	})
+	return out, err
+}
+
+// RollbackSnapshot 事务内回滚到指定版本：校验目标快照存在后原子更新 Project 三个字段，
+// 并新建一条回滚快照（版本继续递增），保证「源码 / 预览 / 版本号」三者一致。
+func RollbackSnapshot(projectID uint, targetVersion int) (*Project, *Snapshot, error) {
+	var p *Project
+	var snap *Snapshot
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var proj Project
+		if err := tx.Where("id = ?", projectID).First(&proj).Error; err != nil {
+			return err
+		}
+		var target Snapshot
+		if err := tx.Where("project_id = ? AND version = ? AND status = ?", projectID, targetVersion, "done").First(&target).Error; err != nil {
+			return fmt.Errorf("目标版本 v%d 不存在或不可回滚", targetVersion)
+		}
+		now := Now()
+		nextVer := proj.Version + 1
+		// 原子更新：HTML 与 LastGoodHTML 同时指向目标版本内容，状态回到 ready
+		if err := tx.Model(&Project{}).Where("id = ?", projectID).Updates(map[string]interface{}{
+			"html": target.HTML, "last_good_html": target.HTML,
+			"status": "ready", "version": nextVer, "updated_at_ms": now,
+		}).Error; err != nil {
+			return err
+		}
+		// 回滚也生成快照（可再回滚回来）：内容 = 目标版本源码
+		s := &Snapshot{ProjectID: projectID, Version: nextVer, HTML: target.HTML,
+			Label: fmt.Sprintf("回滚至 v%d", targetVersion), Status: "done", CreatedAtMs: now}
+		if err := tx.Create(s).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("id = ?", projectID).First(&proj).Error; err != nil {
+			return err
+		}
+		p = &proj
+		snap = s
+		return nil
+	})
+	return p, snap, err
+}
+
+// MarkProjectStatus 事务内更新项目状态与 LastGoodHTML（失败/停止时保留最后成功版本）。
+func MarkProjectStatus(projectID uint, status string, keepHTML bool) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var p Project
+		if err := tx.Where("id = ?", projectID).First(&p).Error; err != nil {
+			return err
+		}
+		updates := map[string]interface{}{"status": status, "updated_at_ms": Now()}
+		// 失败/停止时：HTML 回退到最后成功版本（若有），保证预览永远指向可用产物
+		if keepHTML && p.LastGoodHTML != "" {
+			updates["html"] = p.LastGoodHTML
+		}
+		return tx.Model(&Project{}).Where("id = ?", projectID).Updates(updates).Error
+	})
+}
+
+// ListSnapshots 返回项目全部成功版本快照（不含 HTML 正文，降传输）。
+func ListSnapshots(projectID uint) ([]Snapshot, error) {
+	var ss []Snapshot
+	err := DB.Where("project_id = ? AND status = ?", projectID, "done").Order("version DESC").Find(&ss).Error
+	return ss, err
+}
 
 // DB 持有全局 gorm 实例。
 var DB *gorm.DB

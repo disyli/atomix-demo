@@ -20,7 +20,11 @@ async function request(path, options = {}) {
 export const api = {
   register: (email, password) => request('/api/auth/register', { method: 'POST', body: JSON.stringify({ email, password }) }),
   login: (email, password) => request('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
+  // 游客一键登录：服务端即时创建一次性游客账号，评审无需注册与 API Key
+  guestLogin: () => request('/api/auth/guest', { method: 'POST', body: '{}' }),
   me: () => request('/api/me'),
+  // 健康检查：返回部署 SHA / 模式 / 游客开关（无需登录）
+  health: () => fetch('/api/health').then(r => r.json()),
   listProjects: () => request('/api/projects'),
   getProject: (id) => request('/api/projects/' + id),
   getEvents: (id) => request('/api/projects/' + id + '/events'),
@@ -30,6 +34,10 @@ export const api = {
   getSource: (id) => request('/api/projects/' + id + '/source'),
   sourceDownloadUrl: (id) => BASE + '/api/projects/' + id + '/source?download=1&t=' +
     encodeURIComponent(localStorage.getItem('atomix_token') || ''),
+  // 版本管理：成功版本快照列表（version DESC，不含源码正文）
+  getSnapshots: (id) => request('/api/projects/' + id + '/snapshots'),
+  // 回滚到指定成功版本（服务端事务保证源码/预览/版本号原子一致）
+  rollback: (id, version) => request('/api/projects/' + id + '/rollback', { method: 'POST', body: JSON.stringify({ version }) }),
   // 迭代修改：在已有项目上追加自然语言修改指令（后端走 ReAct 循环）
   refine: (id, instruction) => request('/api/projects/' + id + '/refine', { method: 'POST', body: JSON.stringify({ instruction }) }),
   // 预览接口由 iframe 直接加载，无法携带 Authorization 头，

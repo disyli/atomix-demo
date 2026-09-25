@@ -4,6 +4,7 @@ package api
 import (
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -29,12 +30,18 @@ type Handlers struct {
 func Register(r *gin.Engine, h *Handlers) {
 	r.Use(cors())
 	r.GET("/api/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "mode": modeName(h.Agent.UseMock), "time": time.Now().UnixMilli()})
+		c.JSON(http.StatusOK, gin.H{
+			"status": "ok", "mode": modeName(h.Agent.UseMock),
+			"time": time.Now().UnixMilli(),
+			"sha": h.Cfg.DeploySHA, // 部署版本标识（核对线上是否为目标提交）
+			"guest": h.Cfg.GuestEnabled,
+		})
 	})
 
 	api := r.Group("/api")
 	api.POST("/auth/register", h.register)
 	api.POST("/auth/login", h.login)
+	api.POST("/auth/guest", h.guestLogin)
 
 	authed := api.Group("", middleware.UserIdentity(h.Cfg.JWTSecret))
 	authed.GET("/me", h.me)
@@ -45,6 +52,8 @@ func Register(r *gin.Engine, h *Handlers) {
 	authed.GET("/projects/:id/messages", h.getProjectMessages)
 	authed.GET("/projects/:id/preview", h.previewHTML)
 	authed.GET("/projects/:id/source", h.projectSource)
+	authed.GET("/projects/:id/snapshots", h.listSnapshots)
+	authed.POST("/projects/:id/rollback", h.rollbackVersion)
 	authed.GET("/generate", h.generateSSE)
 	authed.POST("/projects/:id/refine", h.refineSSE)
 	authed.POST("/chat", h.chatIntent)
@@ -53,6 +62,79 @@ func Register(r *gin.Engine, h *Handlers) {
 	authed.GET("/attachments/:id", h.getAttachment)
 	authed.POST("/permissions/:reqId", h.resolvePermission)
 	authed.POST("/runs/:runId/cancel", h.cancelRun)
+}
+
+// guestLogin 一次性评审账号：每次调用创建独立 guest 用户（guest_时间戳@guest.atomix），
+// 返回与注册同构的 token。评审无需注册个人账号或暴露 API Key；开关经
+// ATOMIX_GUEST_ENABLED 控制（默认开）。
+func (h *Handlers) guestLogin(c *gin.Context) {
+	if !h.Cfg.GuestEnabled {
+		c.JSON(http.StatusForbidden, gin.H{"error": "游客入口未开放"})
+		return
+	}
+	email := fmt.Sprintf("guest_%d@guest.atomix", time.Now().UnixNano())
+	hash, err := auth.HashPassword("guest-only-no-login")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "服务器错误"})
+		return
+	}
+	u := &store.User{Email: email, PasswordHash: hash, CreatedAtMs: store.Now(), UpdatedAtMs: store.Now()}
+	if err := store.DB.Create(u).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建游客失败"})
+		return
+	}
+	token, _ := auth.IssueToken(h.Cfg.JWTSecret, u.ID, u.Email)
+	c.JSON(http.StatusOK, gin.H{
+		"token": token,
+		"user":  gin.H{"id": u.ID, "email": u.Email, "guest": true},
+	})
+}
+
+// listSnapshots 项目版本快照列表（不含 HTML 正文）：回滚面板数据源。
+func (h *Handlers) listSnapshots(c *gin.Context) {
+	var p store.Project
+	if err := store.DB.Where("id = ? AND user_id = ?", c.Param("id"), middleware.UID(c)).First(&p).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "项目不存在"})
+		return
+	}
+	snaps, err := store.ListSnapshots(p.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取快照失败"})
+		return
+	}
+	out := make([]gin.H, 0, len(snaps))
+	for _, s := range snaps {
+		out = append(out, gin.H{
+			"id": s.ID, "version": s.Version, "label": s.Label,
+			"status": s.Status, "createdAt": s.CreatedAtMs,
+			"current": s.Version == p.Version,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"current": p.Version, "snapshots": out})
+}
+
+// rollbackVersion 回滚到指定版本：事务内原子更新 HTML/LastGoodHTML/Version，
+// 生成回滚快照；返回最新项目（前端据此原子刷新预览与源码）。
+func (h *Handlers) rollbackVersion(c *gin.Context) {
+	var req struct {
+		Version int `json:"version"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Version <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "version 必须为正整数"})
+		return
+	}
+	var own store.Project
+	if err := store.DB.Where("id = ? AND user_id = ?", c.Param("id"), middleware.UID(c)).First(&own).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "项目不存在"})
+		return
+	}
+	p, snap, err := store.RollbackSnapshot(own.ID, req.Version)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	store.DB.Create(&store.Event{ProjectID: own.ID, Stage: "done", Message: fmt.Sprintf("已回滚至 v%d（当前 v%d）", req.Version, p.Version), Level: "warn", TsMs: store.Now()})
+	c.JSON(http.StatusOK, gin.H{"project": projectBrief(*p), "rollbackTo": req.Version, "snapshot": gin.H{"version": snap.Version, "label": snap.Label}})
 }
 
 // resolvePermission 用户对权限确认卡片做出决定：allow / allow_session / reject。
@@ -275,7 +357,7 @@ func (h *Handlers) listProjects(c *gin.Context) {
 func projectBrief(p store.Project) gin.H {
 	return gin.H{
 		"id": p.ID, "userId": p.UserID, "name": p.Name, "brief": p.Brief,
-		"template": p.Template, "status": p.Status,
+		"template": p.Template, "status": p.Status, "version": p.Version,
 		"createdAt": p.CreatedAtMs, "updatedAt": p.UpdatedAtMs,
 	}
 }
@@ -466,19 +548,14 @@ func (h *Handlers) generateSSE(c *gin.Context) {
 	})
 	if errors.Is(err, agent.ErrCanceled) {
 		// 用户主动停止：发 runId 供前端定位 + stopped 终态事件（非 error）
-		agent.AppendRunMessage(uid, brief, 0, "stopped")
 		send("runId", runID)
 		send("stopped", "已按用户要求停止构建")
 		return
 	}
 	if err != nil {
-		agent.AppendRunMessage(uid, brief, 0, "failed")
 		send("error", "生成失败: "+err.Error())
 		return
 	}
-	// 对话消息持久化：首轮构建的用户消息 + 助手构建回合（done 终态）
-	agent.AppendUserMessage(project.ID, uid, brief)
-	agent.AppendRunMessage(project.ID, brief, uid, "done")
 	// 重新加载完整事件历史
 	var es []store.Event
 	store.DB.Where("project_id = ?", project.ID).Order("id ASC").Find(&es)
@@ -534,21 +611,15 @@ func (h *Handlers) refineSSE(c *gin.Context) {
 		},
 	})
 	if errors.Is(err, agent.ErrCanceled) {
-		// 每轮修改的用户指令 + stopped 回合消息（同 project 保存为新对话轮次）
-		agent.AppendUserMessage(p.ID, uid, req.Instruction)
-		agent.AppendRunMessage(p.ID, req.Instruction, uid, "stopped")
+		// 用户主动停止：stopped 终态事件（Message 落库由 Refine 内部统一处理）
 		send("runId", runID)
 		send("stopped", "已按用户要求停止构建")
 		return
 	}
 	if err != nil {
-		agent.AppendUserMessage(p.ID, uid, req.Instruction)
-		agent.AppendRunMessage(p.ID, req.Instruction, uid, "failed")
 		send("error", "修改失败: "+err.Error())
 		return
 	}
-	// 每轮修改的用户指令 + done 回合消息：同一 project 的每一轮对话都保存为新记录
-	agent.AppendUserMessage(p.ID, uid, req.Instruction)
-	agent.AppendRunMessage(p.ID, req.Instruction, uid, "done")
+	// 修改成功：每轮对话消息（user + assistant run）已由 Refine 内部落库
 	send("done", toJSON(gin.H{"project": projectBrief(*updated), "runId": runID}))
 }

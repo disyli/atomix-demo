@@ -14,12 +14,12 @@ import (
 func planAppToolDef() llm.Tool {
 	return llm.Tool{Type: "function", Function: llm.ToolFunction{
 		Name:        "plan_app",
-		Description: "规划应用：根据需求选定应用名、模板（todo 待办清单 / notes 彩色便签墙 / kanban 轻量看板）与构建步骤。必须最先调用。",
+		Description: "规划应用：根据需求选定应用名、模板（todo 待办清单 / notes 彩色便签墙 / kanban 轻量看板 / calculator 计算器 / snake 贪吃蛇）与构建步骤。必须最先调用。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
     "app_name":     {"type": "string", "description": "应用名，中文，不超过 8 字"},
-    "template":     {"type": "string", "enum": ["todo", "notes", "kanban"], "description": "最贴合需求的模板"},
+    "template":     {"type": "string", "enum": ["todo", "notes", "kanban", "calculator", "snake"], "description": "最贴合需求的模板"},
     "reason":       {"type": "string", "description": "一句话选择理由（中文）"},
     "steps":        {"type": "array", "items": {"type": "string"}, "description": "3-6 条构建步骤（中文短语）"}
   },
@@ -264,6 +264,8 @@ func (rt *reactSession) toolWrite(argsJSON string) toolResult {
 	}
 	rt.html = args.Content
 	rt.writes++
+	// 产物变化后必须重新校验：重置完成门控
+	rt.checksPassed = false
 	return toolResult{OK: true, Observe: fmt.Sprintf("index.html 已写入（%d 字符，剩余整体写入次数 %d）。请立即调用 run_checks 校验产物。", len(args.Content), maxWrites-rt.writes), Think: fmt.Sprintf("写入 index.html（%d 字符）", len(args.Content))}
 }
 
@@ -306,6 +308,8 @@ func (rt *reactSession) toolEdit(argsJSON string) toolResult {
 		return toolResult{OK: false, Observe: "替换未产生变化（new_string 与 old_string 相同）。"}
 	}
 	rt.html = newHTML
+	// 产物变化后必须重新校验：重置完成门控
+	rt.checksPassed = false
 	return toolResult{OK: true, Observe: fmt.Sprintf("edit_file 成功：替换 %d 处，产物现为 %d 字符。请调用 run_checks 确认修改未破坏校验。", count, len(rt.html)), Think: fmt.Sprintf("精准修改 index.html（%d → %d 字符）", len(rt.html)-len(args.NewString)+len(args.OldString), len(rt.html))}
 }
 
@@ -350,6 +354,8 @@ func (rt *reactSession) toolChecks() toolResult {
 
 	if len(issues) == 0 {
 		rt.detail("verify", "校验全部通过", "info")
+		// 完成门控置位：产物已通过校验，finish 与最终落库均以此为准
+		rt.checksPassed = true
 		return toolResult{OK: true, Observe: "校验通过：文档结构、沙箱兼容性、存储降级、交互绑定、体积均无问题（含浏览器实测）。可以调用 finish 收尾。"}
 	}
 	rt.detail("verify", fmt.Sprintf("发现 %d 个问题，需修复后重新提交产物", len(issues)), "warn")
@@ -376,6 +382,10 @@ func (rt *reactSession) toolFinish(argsJSON string) toolResult {
 	}
 	if rt.phase == "plan" {
 		return toolResult{OK: false, Observe: "规划阶段不能 finish：请先 commit_plan 提交规划。"}
+	}
+	// 完成门控：必须刚执行过 run_checks 且零 issue（跳过校验直接 finish 被拒绝）
+	if !rt.checksPassed {
+		return toolResult{OK: false, Observe: "finish 被拒绝：产物尚未通过 run_checks 校验（或校验后又发生了修改）。请先调用 run_checks，issues 为空才能收尾。"}
 	}
 	if issues := checkProduct(rt.html); len(issues) > 0 {
 		return toolResult{OK: false, Observe: "finish 被拒绝：产物仍有未通过校验的问题：\n- " + strings.Join(issues, "\n- ") + "\n请修复后重新提交再 finish。"}

@@ -39,6 +39,7 @@ type reactSession struct {
 	writes     int            // write_file 成功写入次数（上限 2：首写 + 一次整体重写）
 	trackEdits bool           // 迭代修改模式：write 成功后进入编辑跟踪，强制后续用 edit_file 精准修改
 	existing   *store.Project // 迭代修改模式：复用的已有项目行，不新建 project
+	checksPassed bool         // run_checks 最近一次执行且零 issue（完成门控：落库前必须为 true）
 }
 
 func (rt *reactSession) stage(stage, msg string) {
@@ -509,9 +510,15 @@ func (a *Agent) Refine(ctx context.Context, userID, projectID uint, instruction 
 	return rt.runProject(ctx, userID, instruction, p.Name)
 }
 
-// runProject 通用执行壳：建项目行（或复用已有行）→ ReAct 循环 → 回填产物与状态。
+// runProject 通用执行壳：建项目行（或复用已有行）→ ReAct 循环 → verified 状态机收尾。
 // 新构建时项目行先落库修复了旧流水线"事件挂在旧项目 / 生成中不可见"的问题；
 // 迭代修改时（existing 非空）复用同一项目行，事件与产物更新都落在该项目上。
+//
+// 状态机（修复"未校验即完成"）：产物必须满足【写入(write/edit) → 校验通过(run_checks) →
+// 落库(HTML+LastGoodHTML) → 快照(CreateSnapshot)】全链路成功，项目才会进入 ready("完成")；
+// 校验未通过 / 循环失败 / 循环耗尽时项目状态落 failed 并保留 LastGoodHTML（最后成功版本），
+// 预览始终指向可用产物；每轮终态同时落 Message 表（此前 generate/refine 失败轮的
+// 用户消息在 handlers 层重复落库且 projectId 传参错位，统一收敛到这里）。
 func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, existingName string) (*store.Project, error) {
 	now := store.Now()
 	project := rt.existing
@@ -532,11 +539,12 @@ func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, exis
 		if err := store.DB.Create(project).Error; err != nil {
 			return nil, err
 		}
+		// 新项目的首轮用户消息在此落库（成功失败都保留，历史回看完整）
+		AppendUserMessage(project.ID, userID, brief)
 	} else {
-		// 复用已有项目行：状态回到 generating，展示"本轮修改进行中"
-		project.Status = "generating"
-		project.UpdatedAtMs = now
-		store.DB.Model(project).Updates(map[string]interface{}{"status": "generating", "updated_at_ms": project.UpdatedAtMs})
+		// 复用已有项目行：状态回到 generating，展示"本轮修改进行中"；本轮指令落 Message
+		AppendUserMessage(project.ID, userID, brief)
+		store.DB.Model(project).Updates(map[string]interface{}{"status": "generating", "updated_at_ms": now})
 	}
 
 	// 事件实时落库：SSE 推送的同时写入 Event 表，历史回看可完整回放 ReAct 轨迹
@@ -564,56 +572,77 @@ func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, exis
 
 	rt.stage("plan", "Agent 已接管任务，开始分析需求…")
 
-	if err := rt.reactLoop(ctx); err != nil {
-		if errors.Is(err, ErrCanceled) {
-			// 用户主动停止：项目标记 stopped（区别于失败），事件留痕供历史回看
-			project.Status = "stopped"
-			project.UpdatedAtMs = store.Now()
-			store.DB.Model(project).Updates(map[string]interface{}{"status": "stopped", "updated_at_ms": project.UpdatedAtMs})
-			rt.appendEvent(project.ID, "done", "用户已停止本次构建", "warn")
+	loopErr := rt.reactLoop(ctx)
+
+	// 用户主动停止：状态 stopped（区别于失败），保留最后成功版本，事件留痕
+	if errors.Is(loopErr, ErrCanceled) {
+		store.MarkProjectStatus(project.ID, "stopped", true)
+		rt.appendEvent(project.ID, "done", "用户已停止本次构建", "warn")
+		AppendRunMessage(project.ID, brief, userID, "stopped")
+		return nil, loopErr
+	}
+
+	// ---------- verified 状态机收尾：完成 = 写入 + 校验通过 + 落库 + 快照 ----------
+	// checksPassed 由 run_checks 工具成功执行且无 issue 时置位（tools.go）
+	hasProduct := rt.html != ""
+	if loopErr == nil && hasProduct && rt.checksPassed {
+		// 全链路成功：模板/名称回填 → 快照事务（version+1 / HTML / LastGoodHTML / status=ready）
+		if rt.existing == nil {
+			if rt.plan.Template != "" {
+				project.Template = rt.plan.Template
+			} else {
+				project.Template = Match(brief)
+			}
+			if existingName == "" && rt.plan.AppName != "" {
+				project.Name = rt.plan.AppName
+			}
+			store.DB.Model(project).Updates(map[string]interface{}{"name": project.Name, "template": project.Template})
+		}
+		label := "首次构建"
+		if rt.existing != nil {
+			label = "迭代：" + truncateText(brief, 60)
+		}
+		snap, snapErr := store.CreateSnapshot(project.ID, rt.html, label)
+		if snapErr != nil {
+			store.MarkProjectStatus(project.ID, "failed", true)
+			rt.appendEvent(project.ID, "done", "版本落库失败: "+snapErr.Error(), "err")
+			AppendRunMessage(project.ID, brief, userID, "failed")
+			return nil, snapErr
+		}
+		// 重载最新项目行（快照事务已更新 version/html 等）
+		if err := store.DB.Where("id = ?", project.ID).First(project).Error; err != nil {
 			return nil, err
 		}
-		project.Status = "failed"
-		project.UpdatedAtMs = store.Now()
-		store.DB.Model(project).Updates(map[string]interface{}{"status": "failed", "updated_at_ms": project.UpdatedAtMs})
-		rt.appendEvent(project.ID, "done", "构建失败: "+err.Error(), "err")
-		return nil, err
-	}
-
-	// 模板与名称回填（复用已有项目时保留原值）
-	if rt.existing == nil {
-		if rt.plan.Template != "" {
-			project.Template = rt.plan.Template
+		rt.appendEvent(project.ID, "done", fmt.Sprintf("产物已通过校验并落库为 v%d：%s", snap.Version, label), "info")
+		if rt.summary != "" {
+			rt.appendEvent(project.ID, "done", rt.summary, "info")
+		}
+		if rt.existing != nil {
+			rt.stage("done", fmt.Sprintf("修改完成，预览已更新（v%d）🎉", snap.Version))
 		} else {
-			project.Template = Match(brief)
+			rt.stage("done", fmt.Sprintf("构建完成，预览已就绪（v%d）🎉", snap.Version))
 		}
-		if existingName == "" && rt.plan.AppName != "" {
-			project.Name = rt.plan.AppName
-		}
-	}
-	project.HTML = rt.html
-	project.Status = "ready"
-	project.UpdatedAtMs = store.Now()
-	if err := store.DB.Model(project).Updates(map[string]interface{}{
-		"name": project.Name, "template": project.Template, "html": project.HTML,
-		"status": project.Status, "updated_at_ms": project.UpdatedAtMs,
-	}).Error; err != nil {
-		return nil, err
+		AppendRunMessage(project.ID, brief, userID, "done")
+		return project, nil
 	}
 
-	if rt.summary != "" {
-		rt.appendEvent(project.ID, "done", rt.summary, "info")
-	} else if rt.existing != nil {
-		rt.appendEvent(project.ID, "done", "修改完成，预览已更新", "info")
-	} else {
-		rt.appendEvent(project.ID, "done", "构建完成，预览已就绪", "info")
+	// ---------- 失败路径：状态 failed 落库 + 保留最后成功版本 ----------
+	reason := "构建失败"
+	switch {
+	case loopErr != nil:
+		reason = "构建失败: " + loopErr.Error()
+	case !hasProduct:
+		reason = "构建失败：循环结束但产物未写入"
+	case !rt.checksPassed:
+		reason = "构建失败：产物未通过校验（存在未修复的 issues），已保留最后成功版本"
 	}
-	if rt.existing != nil {
-		rt.stage("done", "修改完成，预览已更新 🎉")
-	} else {
-		rt.stage("done", "构建完成，预览已就绪 🎉")
+	store.MarkProjectStatus(project.ID, "failed", true)
+	rt.appendEvent(project.ID, "done", reason, "err")
+	if loopErr == nil {
+		loopErr = fmt.Errorf("%s", reason)
 	}
-	return project, nil
+	AppendRunMessage(project.ID, brief, userID, "failed")
+	return nil, loopErr
 }
 
 // appendEvent 写入一条项目事件。
