@@ -31,9 +31,9 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
-	// 信任本机 nginx 反向代理传来的 X-Forwarded-For / X-Real-IP（127.0.0.1）
-	// 使 c.ClientIP() 在限流等场景下得到真实客户端 IP 而非代理地址
-	if err := r.SetTrustedProxies([]string{"127.0.0.1", "::1"}); err != nil {
+	// 信任本机 nginx 反向代理（127.0.0.1）及 Docker 默认网桥（172.17.0.0/16）
+	// 使 c.ClientIP() 能读取 nginx 注入的 X-Real-IP，得到真实客户端 IP
+	if err := r.SetTrustedProxies([]string{"127.0.0.1", "::1", "172.16.0.0/12"}); err != nil {
 		log.Printf("SetTrustedProxies: %v", err)
 	}
 

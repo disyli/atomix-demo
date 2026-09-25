@@ -47,7 +47,7 @@ func Register(r *gin.Engine, h *Handlers) {
 	// 游客接口：每 IP 每分钟最多 5 次，防止批量刷库与余额消耗
 	api.POST("/auth/guest", guestRateLimiter(), h.guestLogin)
 
-	authed := api.Group("", middleware.UserIdentity(h.Cfg.JWTSecret))
+	authed := api.Group("", middleware.UserIdentity(h.Cfg.JWTSecret, h.Cfg.TicketSecret))
 	authed.GET("/me", h.me)
 	authed.GET("/projects", h.listProjects)
 	authed.POST("/projects", h.createProject)
@@ -679,11 +679,8 @@ func ticketOrBearer(jwtSecret, ticketSecret string) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		// 无 ticket 时走 Bearer token（兼容直接 API 调用）
+		// 无 ticket 时走 Bearer token（直接 API 调用路径）
 		token := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
-		if token == "" {
-			token = c.Query("t") // 兼容旧链接
-		}
 		if token == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 			return
@@ -710,7 +707,8 @@ func randomHex(n int) string {
 }
 
 // guestRateLimiter 游客注册速率限制：每 IP 每分钟最多 5 次，防止批量刷库与消耗 LLM 余额。
-// 使用内存滑动窗口（服务重启后计数清零，重启本身有一定限流效果）。
+// 优先读 nginx 注入的 X-Real-IP（比 c.ClientIP() 更可靠，不受 Docker 网桥影响）；
+// 内存滑动窗口，后台协程每 5 分钟清理过期条目，防内存无限增长。
 func guestRateLimiter() gin.HandlerFunc {
 	type entry struct {
 		count    int
@@ -719,8 +717,28 @@ func guestRateLimiter() gin.HandlerFunc {
 	var mu sync.Mutex
 	ipMap := map[string]*entry{}
 
+	// 后台清理：每 5 分钟扫描并删除窗口早已过期的条目
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now().UnixMilli()
+			mu.Lock()
+			for ip, e := range ipMap {
+				if now-e.windowMs >= int64(2*60*1000) { // 超过 2 分钟未活跃则清理
+					delete(ipMap, ip)
+				}
+			}
+			mu.Unlock()
+		}
+	}()
+
 	return func(c *gin.Context) {
-		ip := c.ClientIP()
+		// 优先取 nginx 注入的 X-Real-IP，回退到 gin 解析的 ClientIP
+		ip := c.GetHeader("X-Real-IP")
+		if ip == "" {
+			ip = c.ClientIP()
+		}
 		now := time.Now().UnixMilli()
 		windowSize := int64(60 * 1000) // 1 分钟
 		const limit = 5

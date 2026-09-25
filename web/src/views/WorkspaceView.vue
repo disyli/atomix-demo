@@ -16,6 +16,7 @@ function logout() {
 const projects = ref([])
 const activeProject = ref(null)
 const previewUrl = ref('')
+let previewTicketTimer = null // 定时刷新预览 ticket 的计时器
 const rightTab = ref('preview')
 const codeView = ref({ loading: false, name: '', filename: '', source: '', lines: 0, size: 0, copied: false })
 const serverMode = ref('')
@@ -304,12 +305,14 @@ function generateSend(text, alreadyRouted, attachIds = []) {
   thread.value.push(run)
   scrollToBottom()
 
-  const params = new URLSearchParams({
-    brief: text, mode: mode.value,
-    attachmentIds: attachIds.join(','), t: localStorage.getItem('atomix_token') || ''
-  })
-  const es = new EventSource('/api/generate?' + params.toString())
-  activeES = es
+  // SSE 必须用短期 ticket 而非长期 token，避免 token 写入 nginx 访问日志
+  api.issueTicket().then(({ ticket }) => {
+    const params = new URLSearchParams({
+      brief: text, mode: mode.value,
+      attachmentIds: attachIds.join(','), ticket
+    })
+    const es = new EventSource('/api/generate?' + params.toString())
+    activeES = es
   es.addEventListener('runId', e => {
     currentRunId.value = e.data
   })
@@ -375,6 +378,9 @@ function generateSend(text, alreadyRouted, attachIds = []) {
     }
     failRun(run, e.data)
     es.close()
+  })
+  }).catch(() => {
+    failRun(run, '获取票据失败，请检查登录状态后重试')
   })
 }
 
@@ -515,7 +521,17 @@ function onShimMessage(e) {
 
 async function setActiveProject(p) {
   activeProject.value = p
+  // 清除旧的 ticket 刷新计时器
+  if (previewTicketTimer) { clearInterval(previewTicketTimer); previewTicketTimer = null }
   previewUrl.value = await api.previewUrl(p.id, readAppData(p.id))
+  // 每 50s 自动换新 ticket，防止 60s 过期后 iframe/新窗口返回 401
+  previewTicketTimer = setInterval(async () => {
+    if (activeProject.value?.id === p.id) {
+      previewUrl.value = await api.previewUrl(p.id, readAppData(p.id))
+    } else {
+      clearInterval(previewTicketTimer); previewTicketTimer = null
+    }
+  }, 50 * 1000)
   rightTab.value = 'preview'
   codeView.value = { loading: false, name: '', filename: '', source: '', lines: 0, size: 0, copied: false }
   versionView.value = { loading: false, current: p.version || 0, snapshots: [], rolling: 0, notice: '' }

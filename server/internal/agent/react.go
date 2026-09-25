@@ -577,12 +577,14 @@ func (a *Agent) Run(ctx context.Context, userID uint, brief, mode string, attach
 // Refine 在已有项目上执行迭代修改：读取旧产物 → ReAct 循环修改 → 回填。
 // 同一 project 的每一轮修改都保存为新的对话轮次（Message 表），项目行本身复用不新建。
 func (a *Agent) Refine(ctx context.Context, userID, projectID uint, instruction string, attachmentIDs []uint, ev PipelineEvents) (*store.Project, error) {
+	// 先加锁，再读项目：防止两次修改同时开始时都基于同一份旧 HTML，后完成的覆盖先完成的
+	unlock := a.LockProject(projectID)
+	defer unlock()
+
 	var p store.Project
 	if err := store.DB.Where("id = ? AND user_id = ?", projectID, userID).First(&p).Error; err != nil {
 		return nil, fmt.Errorf("项目不存在")
 	}
-	// 同一项目同时只允许一次构建/迭代，防并发覆盖
-	defer a.LockProject(projectID)()
 	rt := &reactSession{
 		a: a, ctx: ctx, userID: userID, brief: instruction, html: p.HTML, attachIDs: attachmentIDs, ev: ev,
 		perm: newPermGateway(a.PermRegistry), budget: newContextBudget(),
