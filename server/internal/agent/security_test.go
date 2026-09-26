@@ -13,11 +13,11 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-	"os"
 
 	"atomix-demo/server/internal/auth"
 	"atomix-demo/server/internal/store"
@@ -83,7 +83,10 @@ func TestAttachmentIsolation_UserB_CannotLoadUserA_Attachment(t *testing.T) {
 func TestAttachmentIsolation_ConcurrentUsers_NoCrossLeak(t *testing.T) {
 	newSecDB(t)
 	const pairs = 10
-	type pair struct{ a, b *store.User; attID uint }
+	type pair struct {
+		a, b  *store.User
+		attID uint
+	}
 	var ps [pairs]pair
 
 	for i := 0; i < pairs; i++ {
@@ -145,8 +148,8 @@ func TestGuestLogin_PasswordIsRandom_NotHardcoded(t *testing.T) {
 // 确认 @guest.atomix 后缀的邮箱被识别为游客。
 func TestGuestEmail_NotAcceptedByLoginRoute(t *testing.T) {
 	emails := []struct {
-		email    string
-		isGuest  bool
+		email   string
+		isGuest bool
 	}{
 		{"guest_1790000000000000000@guest.atomix", true},
 		{"alice@example.com", false},

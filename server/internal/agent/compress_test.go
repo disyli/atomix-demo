@@ -16,7 +16,7 @@ import (
 // 2) 消息总数明显减少；3) 保留 system。
 func TestCompressBuildModeKeepsPairing(t *testing.T) {
 	// 填充长内容让总字符超预算触发压缩
- filler := strings.Repeat("历史工具观察回喂数据。", 800)
+	filler := strings.Repeat("历史工具观察回喂数据。", 800)
 	msgs := []llm.ChatMessage{
 		{Role: "system", Content: "系统提示词，包含用户需求：做一个极简计算器"},
 	}
@@ -24,8 +24,8 @@ func TestCompressBuildModeKeepsPairing(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		call := mkCall("call_"+itoa(i), "write_file", `{"path":"index.html","content":"`+filler+`"}`)
 		msgs = append(msgs, llm.ChatMessage{
-			Role: "assistant",
-			Content: "第" + itoa(i) + "轮思考：继续推进构建",
+			Role:      "assistant",
+			Content:   "第" + itoa(i) + "轮思考：继续推进构建",
 			ToolCalls: []llm.ToolCall{call},
 		})
 		msgs = append(msgs, llm.ChatMessage{
@@ -64,8 +64,8 @@ func TestCompressRefineModeKeepsInitialUser(t *testing.T) {
 	for i := 0; i < 18; i++ {
 		call := mkCall("c"+itoa(i), "edit_file", `{"old":"`+filler+`","new":"x"}`)
 		msgs = append(msgs, llm.ChatMessage{
-			Role: "assistant",
-			Content: "第" + itoa(i) + "轮思考",
+			Role:      "assistant",
+			Content:   "第" + itoa(i) + "轮思考",
 			ToolCalls: []llm.ToolCall{call},
 		})
 		msgs = append(msgs, llm.ChatMessage{

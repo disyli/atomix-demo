@@ -29,14 +29,22 @@ type Handlers struct {
 	Agent *agent.Agent
 }
 
+// 自由文本输入长度上限（rune 计）：需求/指令类 20000 字已远超正常使用，
+// 超限直接 400，防止超大 payload 拖慢 DB 写入与无谓消耗 LLM 余额。
+const (
+	maxBriefLen    = 20000
+	maxChatMsgLen  = 8000
+	maxPasswordLen = 128
+)
+
 // Register 注册全部路由。
 func Register(r *gin.Engine, h *Handlers) {
 	r.Use(cors())
 	r.GET("/api/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ok", "mode": modeName(h.Agent.UseMock),
-			"time": time.Now().UnixMilli(),
-			"sha": h.Cfg.DeploySHA, // 部署版本标识（核对线上是否为目标提交）
+			"time":  time.Now().UnixMilli(),
+			"sha":   h.Cfg.DeploySHA, // 部署版本标识（核对线上是否为目标提交）
 			"guest": h.Cfg.GuestEnabled,
 		})
 	})
@@ -73,8 +81,12 @@ func Register(r *gin.Engine, h *Handlers) {
 	// 票据验证路由（不在 authed 组，只接受 ticket 或 Bearer）
 	tb := ticketOrBearer(h.Cfg.JWTSecret, h.Cfg.TicketSecret)
 	r.GET("/api/generate", tb, h.generateSSE)
-	r.GET("/api/projects/:id/preview", tb, h.previewHTML)
 	r.GET("/api/projects/:id/source", tb, h.projectSource)
+
+	// 预览专用：HttpOnly Cookie 鉴权（iframe 与新窗口同源自动携带，无 60s 过期问题，
+	// 也不会把任何凭据写进 URL/访问日志；CSP sandbox 头保证新窗口与 iframe 同样隔离）
+	pv := r.Group("/api/projects/:id/preview", previewCookie(h.Cfg.TicketSecret))
+	pv.GET("", h.previewHTML)
 }
 
 // guestLogin 一次性评审账号：每次调用创建独立 guest 用户（guest_时间戳@guest.atomix），
@@ -322,10 +334,29 @@ type credReq struct {
 	Password string `json:"password"`
 }
 
+// validEmail 简单但够用的邮箱校验：局部@域名，域名含点或为 localhost 形式。
+// 不追求 RFC 5322 完整覆盖（评审场景），只挡明显非法输入（如 "x"）。
+func validEmail(s string) bool {
+	at := strings.IndexByte(s, '@')
+	if at <= 0 || at == len(s)-1 {
+		return false
+	}
+	domain := s[at+1:]
+	return !strings.ContainsAny(s, " \t\n\r") && strings.Contains(domain, ".")
+}
+
+// normalizeEmail 邮箱统一小写：A@b.c 与 a@b.c 视为同一账号（防大小写变体重复注册）。
+func normalizeEmail(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
+
 func (h *Handlers) register(c *gin.Context) {
 	var req credReq
-	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" || len(req.Password) < 6 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "邮箱不能为空，密码至少 6 位"})
+	if err := c.ShouldBindJSON(&req); err != nil || !validEmail(req.Email) || len(req.Password) < 6 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "邮箱格式不正确，密码至少 6 位"})
+		return
+	}
+	req.Email = normalizeEmail(req.Email)
+	if len(req.Password) > 128 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "密码不能超过 128 位"})
 		return
 	}
 	var cnt int64
@@ -350,10 +381,11 @@ func (h *Handlers) register(c *gin.Context) {
 
 func (h *Handlers) login(c *gin.Context) {
 	var req credReq
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBindJSON(&req); err != nil || !validEmail(req.Email) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
 		return
 	}
+	req.Email = normalizeEmail(req.Email)
 	// 游客账号只能通过 /auth/guest 接口获取 token，密码接口明确拒绝
 	if strings.HasSuffix(req.Email, "@guest.atomix") {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "邮箱或密码错误"})
@@ -396,6 +428,10 @@ func (h *Handlers) createProject(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || req.Brief == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "需求描述不能为空"})
+		return
+	}
+	if len([]rune(req.Brief)) > maxBriefLen {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "需求描述过长（上限 20000 字）"})
 		return
 	}
 	p := &store.Project{UserID: middleware.UID(c), Brief: req.Brief, Status: "draft", CreatedAtMs: store.Now(), UpdatedAtMs: store.Now()}
@@ -472,14 +508,18 @@ func (h *Handlers) projectSource(c *gin.Context) {
 		"source": p.HTML, "size": len(p.HTML), "lines": lines,
 	})
 }
+
 // 沙箱 iframe 无 allow-same-origin 时产物访问 localStorage 会抛 SecurityError，
 // 这里在 <head> 前注入存储垫片：探测失败则以内存存储降级并通知父页面。
+// CSP sandbox 响应头让「新窗口直接打开」与 iframe 处于同等隔离强度：
+// 生成的 HTML 来自 LLM（可能受附件提示注入影响），必须假定不可信、隔离存储与网络。
 func (h *Handlers) previewHTML(c *gin.Context) {
 	var p store.Project
 	if err := store.DB.Where("id = ? AND user_id = ?", c.Param("id"), middleware.UID(c)).First(&p).Error; err != nil {
 		c.String(http.StatusNotFound, "project not found")
 		return
 	}
+	c.Header("Content-Security-Policy", "sandbox allow-scripts allow-forms allow-modals")
 	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(agent.InjectStorageShim(p.HTML)))
 }
 
@@ -495,6 +535,10 @@ func (h *Handlers) chatIntent(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Message) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "消息不能为空"})
+		return
+	}
+	if len([]rune(req.Message)) > maxChatMsgLen {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "消息过长（上限 8000 字）"})
 		return
 	}
 	uid := middleware.UID(c)
@@ -525,6 +569,10 @@ func (h *Handlers) generateSSE(c *gin.Context) {
 	brief := c.Query("brief")
 	if brief == "" {
 		c.String(http.StatusBadRequest, "brief required")
+		return
+	}
+	if len([]rune(brief)) > maxBriefLen {
+		c.String(http.StatusBadRequest, "brief too long (max 20000 chars)")
 		return
 	}
 	mode := c.DefaultQuery("mode", "build")
@@ -604,6 +652,10 @@ func (h *Handlers) refineSSE(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "修改指令不能为空"})
 		return
 	}
+	if len([]rune(req.Instruction)) > maxBriefLen {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "修改指令过长（上限 20000 字）"})
+		return
+	}
 	var p store.Project
 	if err := store.DB.Where("id = ? AND user_id = ?", c.Param("id"), uid).First(&p).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "项目不存在"})
@@ -657,19 +709,57 @@ func (h *Handlers) refineSSE(c *gin.Context) {
 	send("done", toJSON(gin.H{"project": projectBrief(*updated), "runId": runID}))
 }
 
-// issueTicket 为当前登录用户签发一个 60 秒有效的短期票据，
-// 用于 preview/source-download 等需要在 URL query 传凭据的场景。
-// 前端持有该 ticket 后在 URL 里用 ticket= 参数代替 t= token，
-// 避免长期 JWT token 写入 nginx 访问日志。
+// issueTicket 为预览签发凭据。v2 起改为 HttpOnly 会话 Cookie（服务端 1 小时有效）：
+// iframe/新窗口同源自动携带，URL 里不再出现任何凭据，也不存在 60s 过期导致的
+// 「预览刷新即 401」问题。SSE（generate）仍用 query ticket（EventSource 无法带 Cookie 之外的
+// 头，且 SSE 生命周期短）。保留 JSON 返回 ticket 供 SSE 使用。
 func (h *Handlers) issueTicket(c *gin.Context) {
 	uid := middleware.UID(c)
 	email := c.GetString("email")
-	ticket, err := auth.IssueTicket(h.Cfg.TicketSecret, uid, email)
+	ticket, err := auth.IssueTicketTTL(h.Cfg.TicketSecret, uid, email, time.Hour)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "签发票据失败"})
 		return
 	}
+	// 预览凭据走 Cookie：HttpOnly（JS 不可读）+ SameSite=Lax（iframe 同源导航携带）
+	// + Session（关浏览器即清）。1 小时后过期，前端 setActiveProject 时会重新签发。
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     "atomix_preview",
+		Value:    ticket,
+		Path:     "/api/projects",
+		MaxAge:   3600,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
 	c.JSON(http.StatusOK, gin.H{"ticket": ticket, "ttl": 60})
+}
+
+// previewCookie 预览路由专用鉴权：读取 atomix_preview Cookie（票据密钥签名、Use=ticket、
+// 1 小时有效）。不设置 Cookie 时为兼容期回落到 query ticket（60s，仅存量链接）。
+func previewCookie(ticketSecret string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ticket, err := c.Cookie("atomix_preview")
+		if err != nil || ticket == "" {
+			// 兼容期回落：URL ticket 仍可用（60s 短期），旧链接/分享场景不立即失效
+			ticket = c.Query("ticket")
+		}
+		if ticket == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "缺少预览凭据，请回到工作台重新打开"})
+			return
+		}
+		claims, err := auth.ParseToken(ticketSecret, ticket)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "预览凭据无效或已过期，请刷新工作台"})
+			return
+		}
+		if claims.Use != "ticket" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "非法凭据类型"})
+			return
+		}
+		c.Set("uid", claims.UserID)
+		c.Set("email", claims.Email)
+		c.Next()
+	}
 }
 
 // ticketOrBearer 双通道鉴权中间件：
@@ -754,7 +844,10 @@ func authRateLimiter() gin.HandlerFunc {
 			ip = c.ClientIP()
 		}
 		now := time.Now().UnixMilli()
-		const (windowSize = int64(60 * 1000); limit = 10)
+		const (
+			windowSize = int64(60 * 1000)
+			limit      = 10
+		)
 		mu.Lock()
 		e, ok := ipMap[ip]
 		if !ok || now-e.windowMs >= windowSize {

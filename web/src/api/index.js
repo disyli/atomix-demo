@@ -38,24 +38,21 @@ export const api = {
   rollback: (id, version) => request('/api/projects/' + id + '/rollback', { method: 'POST', body: JSON.stringify({ version }) }),
   // 迭代修改：在已有项目上追加自然语言修改指令（后端走 ReAct 循环）
   refine: (id, instruction) => request('/api/projects/' + id + '/refine', { method: 'POST', body: JSON.stringify({ instruction }) }),
-  // 签发短期票据（60s），用于 preview/download URL，避免长期 token 出现在访问日志
+  // 签发预览凭据：服务端设置 HttpOnly Cookie（1 小时），iframe/新窗口同源自动携带；
+  // 返回的 ticket 仅用于 SSE（EventSource 走 query 参数）
   issueTicket: () => request('/api/ticket', { method: 'POST', body: '{}' }),
-  // fetchTicket：预取票据但不使用（定时器静默续约用，不刷新 iframe src）
-  fetchTicket: () => request('/api/ticket', { method: 'POST', body: '{}' }),
-  // 预览 URL：先换取 60s ticket，再拼入 URL（ticket 比长期 token 安全，过期即失效）
+  // 预览 URL：无需任何凭据参数（HttpOnly Cookie 自动附带），URL 干净、不过期、不进访问日志
   previewUrl: async (id, payload) => {
-    let ticket = ''
-    try { ticket = (await request('/api/ticket', { method: 'POST', body: '{}' })).ticket } catch {}
-    let url = BASE + '/api/projects/' + id + '/preview?ticket=' + encodeURIComponent(ticket)
+    try { await request('/api/ticket', { method: 'POST', body: '{}' }) } catch {}
+    let url = BASE + '/api/projects/' + id + '/preview'
     if (payload && Object.keys(payload).length) {
       url += '#atomix-data=' + encodeURIComponent(JSON.stringify(payload))
     }
     return url
   },
-  // 源码下载 URL：同理用短期 ticket
+  // 源码下载 URL：同样凭 Cookie 鉴权，URL 不含任何凭据
   sourceDownloadUrl: async (id) => {
-    let ticket = ''
-    try { ticket = (await request('/api/ticket', { method: 'POST', body: '{}' })).ticket } catch {}
-    return BASE + '/api/projects/' + id + '/source?download=1&ticket=' + encodeURIComponent(ticket)
+    try { await request('/api/ticket', { method: 'POST', body: '{}' }) } catch {}
+    return BASE + '/api/projects/' + id + '/source?download=1'
   }
 }

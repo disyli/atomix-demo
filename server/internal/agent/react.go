@@ -22,7 +22,7 @@ const (
 type reactSession struct {
 	a          *Agent
 	ctx        context.Context
-	userID     uint   // 本次任务归属用户（附件归属校验用，不走全局共享字段）
+	userID     uint // 本次任务归属用户（附件归属校验用，不走全局共享字段）
 	brief      string
 	html       string
 	plan       PlanResult
@@ -33,14 +33,14 @@ type reactSession struct {
 	ev         PipelineEvents
 
 	// agent 加固状态
-	perm       *permGateway   // 工具权限网关
-	budget     *contextBudget // 上下文预算与压缩器
-	phase      string         // plan 模式两阶段门控：plan（只允许规划工具）→ act（全量工具）
-	research   string         // research 模式下子 Agent 产出的需求简报
-	writes     int            // write_file 成功写入次数（上限 2：首写 + 一次整体重写）
-	trackEdits bool           // 迭代修改模式：write 成功后进入编辑跟踪，强制后续用 edit_file 精准修改
-	existing   *store.Project // 迭代修改模式：复用的已有项目行，不新建 project
-	checksPassed bool         // run_checks 最近一次执行且零 issue（完成门控：落库前必须为 true）
+	perm         *permGateway   // 工具权限网关
+	budget       *contextBudget // 上下文预算与压缩器
+	phase        string         // plan 模式两阶段门控：plan（只允许规划工具）→ act（全量工具）
+	research     string         // research 模式下子 Agent 产出的需求简报
+	writes       int            // write_file 成功写入次数（上限 2：首写 + 一次整体重写）
+	trackEdits   bool           // 迭代修改模式：write 成功后进入编辑跟踪，强制后续用 edit_file 精准修改
+	existing     *store.Project // 迭代修改模式：复用的已有项目行，不新建 project
+	checksPassed bool           // run_checks 最近一次执行且零 issue（完成门控：落库前必须为 true）
 }
 
 func (rt *reactSession) stage(stage, msg string) {
@@ -562,6 +562,8 @@ func mustJSON(v interface{}) string {
 
 // Run 执行完整构建任务：先落库项目行（生成中状态可见），再跑 ReAct 循环，完成后回填产物。
 // mode: build | plan | research；attachmentIDs: 随任务携带的附件。
+// 新建项目行后立即持有项目锁直到构建结束：防止「项目生成中又被发起迭代修改」时
+// 两条流水线并发写同一项目行（Run 无锁时与 Refine/Rollback 不互斥）。
 func (a *Agent) Run(ctx context.Context, userID uint, brief, mode string, attachmentIDs []uint, ev PipelineEvents) (*store.Project, error) {
 	rt := &reactSession{
 		a: a, ctx: ctx, userID: userID, brief: brief, mode: mode, attachIDs: attachmentIDs, ev: ev,
@@ -623,6 +625,10 @@ func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, exis
 		if err := store.DB.Create(project).Error; err != nil {
 			return nil, err
 		}
+		// 新建项目行即持有项目锁直到本函数返回：与 Refine/Rollback/TryLock 互斥，
+		// 消除「生成中发起迭代修改」两条流水线并发写同一项目的窗口
+		unlock := rt.a.LockProject(project.ID)
+		defer unlock()
 		// 新项目的首轮用户消息在此落库（成功失败都保留，历史回看完整）
 		AppendUserMessage(project.ID, userID, brief)
 	} else {

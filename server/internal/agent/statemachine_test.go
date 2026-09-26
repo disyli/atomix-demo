@@ -22,8 +22,8 @@ import (
 // scriptLLM 按预设脚本驱动 ReAct 循环的假模型：每次 ChatWithTools 吐出脚本中的
 // 下一步工具调用，用于单测中模拟真实模型的各种行为序列（写入/校验/编辑/收尾/失败）。
 type scriptLLM struct {
-	steps  []llm.ToolCall
-	calls  int
+	steps []llm.ToolCall
+	calls int
 }
 
 func (s *scriptLLM) ChatJSON(ctx context.Context, m []llm.ChatMessage) (string, error) {
@@ -141,10 +141,10 @@ func newTestUser(t *testing.T) uint {
 // newTestAgent 用脚本模型构造 Agent（OnPermission 置空 → 权限自动放行路径）。
 func newTestAgent(script []llm.ToolCall) *Agent {
 	return &Agent{
-		LLM:      &scriptLLM{steps: script},
-		UseMock:  false,
+		LLM:          &scriptLLM{steps: script},
+		UseMock:      false,
 		PermRegistry: NewPermRegistry(),
-		Runs:     NewRunRegistry(),
+		Runs:         NewRunRegistry(),
 	}
 }
 
@@ -414,10 +414,10 @@ func TestDemoModeStateMachine(t *testing.T) {
 	openTestDB(t)
 	uid := newTestUser(t)
 	ag := &Agent{
-		LLM:      &scriptLLM{},
-		UseMock:  true,
+		LLM:          &scriptLLM{},
+		UseMock:      true,
 		PermRegistry: NewPermRegistry(),
-		Runs:     NewRunRegistry(),
+		Runs:         NewRunRegistry(),
 	}
 	p, err := ag.Run(context.Background(), uid, "做一个待办清单，支持勾选完成", "build", nil, PipelineEvents{})
 	if err != nil {

@@ -43,9 +43,15 @@ func IssueToken(secret string, userID uint, email string) (string, error) {
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
 }
 
-// IssueTicket 签发 60 秒有效期的短期票据（预览/下载专用）。
+// IssueTicket 签发 60 秒有效期的短期票据（预览/下载/SSE 专用）。
 // Claims.Use = "ticket" 标记用途，jti 为随机 ID（防票据被客户端缓存后反复使用）。
 func IssueTicket(ticketSecret string, userID uint, email string) (string, error) {
+	return IssueTicketTTL(ticketSecret, userID, email, 60*time.Second)
+}
+
+// IssueTicketTTL 指定有效期签发票据：IssueTicket 的参数化版本。
+// 测试用极短 TTL 走真实的 jwt 过期校验路径（ExpiresAt 由解析器强制验证）。
+func IssueTicketTTL(ticketSecret string, userID uint, email string, ttl time.Duration) (string, error) {
 	jti := fmt.Sprintf("%d-%x", userID, time.Now().UnixNano())
 	claims := Claims{
 		UserID: userID,
@@ -53,7 +59,7 @@ func IssueTicket(ticketSecret string, userID uint, email string) (string, error)
 		Use:    "ticket",
 		RegisteredClaims: jwt.RegisteredClaims{
 			ID:        jti,
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(60 * time.Second)),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
 	}

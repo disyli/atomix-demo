@@ -1,7 +1,6 @@
 package auth_test
 
 import (
-	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +46,30 @@ func TestIssueTicket_HasUseField(t *testing.T) {
 	if claims.UserID != 7 {
 		t.Errorf("UserID want 7 got %d", claims.UserID)
 	}
+	if claims.ExpiresAt == nil {
+		t.Fatal("ticket 应携带 ExpiresAt")
+	}
+	// IssueTicket 默认 60s：过期时间应在 [59s, 61s] 区间（容许时钟抖动）
+	remain := time.Until(claims.ExpiresAt.Time)
+	if remain < 59*time.Second || remain > 61*time.Second {
+		t.Errorf("IssueTicket 默认有效期应约 60s，实际剩余 %v", remain)
+	}
+}
+
+// TestIssueTicketTTL_CustomTTL 参数化 TTL：1 小时票据（预览 Cookie）与 60s 票据各自正确
+func TestIssueTicketTTL_CustomTTL(t *testing.T) {
+	long, err := auth.IssueTicketTTL(ticketSecret, 1, "a@b.com", time.Hour)
+	if err != nil {
+		t.Fatalf("IssueTicketTTL error: %v", err)
+	}
+	claims, err := auth.ParseToken(ticketSecret, long)
+	if err != nil {
+		t.Fatalf("ParseToken error: %v", err)
+	}
+	remain := time.Until(claims.ExpiresAt.Time)
+	if remain < 59*time.Minute || remain > 61*time.Minute {
+		t.Errorf("1h 票据剩余应约 60min，实际 %v", remain)
+	}
 }
 
 // TestTicket_RejectedByJwtSecret 票据用 jwtSecret 解析应失败（密钥隔离）
@@ -67,17 +90,21 @@ func TestToken_RejectedByTicketSecret(t *testing.T) {
 	}
 }
 
-// TestParseToken_Expired 验证过期 token 解析失败
+// TestParseToken_Expired 真实过期路径：签发短 TTL 票据并等到过期，解析必须失败。
+// TTL 用 2s：JWT NumericDate 是秒级精度，亚秒 TTL 会被截断成"签发即过期"。
+// （此前版本用伪造签名的字符串测 err!=nil，实际测的是签名错误而非过期。）
 func TestParseToken_Expired(t *testing.T) {
-	// IssueTicket 正常给 60s，这里直接做一个用 1ns 的 token（即刻过期）
-	// 通过 time.Sleep 等到过期（只 1ms，不影响测试速度）
-	// 因为 IssueTicket 固定 60s，改用内部方法伪造不方便；
-	// 此处验证 ParseToken 在 token 已过期后（例如被篡改 ExpiresAt）的行为，
-	// 用一个非法签名的 expired-looking token 字符串来测 err != nil 路径
-	fakeExpiredToken := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjEsImVtYWlsIjoiYUBiLmNvbSIsImV4cCI6MX0.invalid"
-	_, err := auth.ParseToken(jwtSecret, fakeExpiredToken)
-	if err == nil {
-		t.Error("解析过期/非法 token 应返回错误")
+	ticket, err := auth.IssueTicketTTL(ticketSecret, 1, "x@y.com", 2*time.Second)
+	if err != nil {
+		t.Fatalf("IssueTicketTTL error: %v", err)
+	}
+	// 未过期时先确认能解析成功（保证不是签名问题导致的假通过）
+	if _, err := auth.ParseToken(ticketSecret, ticket); err != nil {
+		t.Fatalf("过期前解析应成功: %v", err)
+	}
+	time.Sleep(2500 * time.Millisecond)
+	if _, err := auth.ParseToken(ticketSecret, ticket); err == nil {
+		t.Error("过期后解析应失败（jwt 校验 ExpiresAt），但未报错")
 	}
 }
 
@@ -98,16 +125,17 @@ func TestHashPassword_CheckPassword(t *testing.T) {
 // TestIssueTicket_JTI_Unique 每次签发的票据 jti 不同（防客户端缓存后复用）
 func TestIssueTicket_JTI_Unique(t *testing.T) {
 	t1, _ := auth.IssueTicket(ticketSecret, 1, "a@b.com")
-	time.Sleep(time.Millisecond)
+	time.Sleep(2 * time.Millisecond) // jti 含纳秒时间戳，确保跨纳秒
 	t2, _ := auth.IssueTicket(ticketSecret, 1, "a@b.com")
 	if t1 == t2 {
 		t.Error("连续签发的票据应不同（jti 含纳秒时间戳）")
 	}
-	// 验证两个票据都能正常解析
-	for _, tok := range []string{t1, t2} {
-		if _, err := auth.ParseToken(ticketSecret, tok); err != nil {
-			t.Errorf("票据 %s 解析失败: %v", tok[:20], err)
-		}
+	c1, err1 := auth.ParseToken(ticketSecret, t1)
+	c2, err2 := auth.ParseToken(ticketSecret, t2)
+	if err1 != nil || err2 != nil {
+		t.Fatalf("票据解析失败: %v / %v", err1, err2)
 	}
-	_ = strings.Contains // suppress unused import
+	if c1.ID == "" || c1.ID == c2.ID {
+		t.Errorf("jti 应非空且唯一，实际 %q vs %q", c1.ID, c2.ID)
+	}
 }

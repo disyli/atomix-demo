@@ -9,9 +9,9 @@ import (
 
 // Config 汇总服务运行所需的全部配置。
 type Config struct {
-	Port          int
-	DataDir       string
-	JWTSecret     string
+	Port      int
+	DataDir   string
+	JWTSecret string
 	// TicketSecret 用于签发短期预览票据（60s），与 JWTSecret 分离避免互相干扰
 	TicketSecret  string
 	DeepSeekKey   string
@@ -51,8 +51,8 @@ func Load() (*Config, error) {
 		DeepSeekURL:   getEnv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
 		DeepSeekModel: getEnv("DEEPSEEK_MODEL", "deepseek-v4-flash-vision-exp"),
 		// 部署标识：优先运行时环境变量（deploy.sh 注入），否则用构建期 ldflags 值
-		DeploySHA:     getEnv("ATOMIX_DEPLOY_SHA", firstNonEmpty(BuiltinDeploySHA, "dev-local")),
-		GuestEnabled:  getEnv("ATOMIX_GUEST_ENABLED", "1") == "1",
+		DeploySHA:    getEnv("ATOMIX_DEPLOY_SHA", firstNonEmpty(BuiltinDeploySHA, "dev-local")),
+		GuestEnabled: getEnv("ATOMIX_GUEST_ENABLED", "1") == "1",
 	}
 	// 票据密钥：优先环境变量，未配置时从 JWTSecret 派生（+_ticket 后缀），保持零配置可用
 	cfg.TicketSecret = getEnv("ATOMIX_TICKET_SECRET", cfg.JWTSecret+"_ticket")

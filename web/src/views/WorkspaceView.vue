@@ -16,7 +16,6 @@ function logout() {
 const projects = ref([])
 const activeProject = ref(null)
 const previewUrl = ref('')
-let previewTicketTimer = null // 定时刷新预览 ticket 的计时器
 const rightTab = ref('preview')
 const codeView = ref({ loading: false, name: '', filename: '', source: '', lines: 0, size: 0, copied: false })
 const serverMode = ref('')
@@ -521,17 +520,9 @@ function onShimMessage(e) {
 
 async function setActiveProject(p) {
   activeProject.value = p
-  // 清除旧的 ticket 刷新计时器
-  if (previewTicketTimer) { clearInterval(previewTicketTimer); previewTicketTimer = null }
+  // 预览凭据走 HttpOnly Cookie（1 小时），切换项目时签发一次即可；
+  // 过期由 preview 401 兜底（用户刷新工作台自然重签），无需前端定时器
   previewUrl.value = await api.previewUrl(p.id, readAppData(p.id))
-  // 每 50s 静默预取新 ticket 并缓存（不改 previewUrl/不重载 iframe），
-  // 仅在用户主动点「新窗口」或 iframe 出错时再使用新 ticket。
-  previewTicketTimer = setInterval(async () => {
-    if (activeProject.value?.id !== p.id) {
-      clearInterval(previewTicketTimer); previewTicketTimer = null; return
-    }
-    try { await api.fetchTicket() } catch (_) {} // 只预取，不改 src
-  }, 50 * 1000)
   rightTab.value = 'preview'
   codeView.value = { loading: false, name: '', filename: '', source: '', lines: 0, size: 0, copied: false }
   versionView.value = { loading: false, current: p.version || 0, snapshots: [], rolling: 0, notice: '' }
@@ -766,7 +757,6 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('message', onShimMessage)
   document.removeEventListener('click', onDocClick)
-  if (previewTicketTimer) { clearInterval(previewTicketTimer); previewTicketTimer = null }
 })
 </script>
 

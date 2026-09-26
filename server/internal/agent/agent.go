@@ -12,8 +12,8 @@ import (
 
 // Agent 负责编排一次应用生成任务。
 type Agent struct {
-	LLM      llm.Service
-	UseMock  bool
+	LLM     llm.Service
+	UseMock bool
 	// PermRegistry 跨任务权限确认注册表：HTTP 确认接口按请求 ID 回填用户决定
 	PermRegistry *PermRegistry
 	// Runs 活跃构建任务注册表：停止按钮经 /api/runs/:runId/cancel 取消运行中的任务
@@ -69,6 +69,7 @@ func (a *Agent) TryLockProject(projectID uint) (func(), bool) {
 	}
 	return nil, false
 }
+
 type PipelineEvents struct {
 	OnStage  func(stage, message string)
 	OnDetail func(stage, message, level string)

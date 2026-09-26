@@ -10,7 +10,7 @@ import (
 type User struct {
 	ID           uint   `gorm:"primaryKey" json:"id"`
 	Email        string `gorm:"uniqueIndex;size:190" json:"email"`
-	PasswordHash string  `json:"-"`
+	PasswordHash string `json:"-"`
 	CreatedAtMs  int64  `json:"createdAt"`
 	UpdatedAtMs  int64  `json:"updatedAt"`
 }
@@ -19,13 +19,13 @@ func (User) TableName() string { return "users" }
 
 // Project 生成任务与产出的应用。
 type Project struct {
-	ID           uint   `gorm:"primaryKey" json:"id"`
-	UserID       uint   `gorm:"index" json:"userId"`
-	Name         string `json:"name"`
-	Brief        string `gorm:"type:text" json:"brief"`
-	Template     string `gorm:"size:32" json:"template"`
-	HTML         string `gorm:"type:text" json:"-"`
-	Status       string `gorm:"size:16" json:"status"`
+	ID       uint   `gorm:"primaryKey" json:"id"`
+	UserID   uint   `gorm:"index" json:"userId"`
+	Name     string `json:"name"`
+	Brief    string `gorm:"type:text" json:"brief"`
+	Template string `gorm:"size:32" json:"template"`
+	HTML     string `gorm:"type:text" json:"-"`
+	Status   string `gorm:"size:16" json:"status"`
 	// Version 当前生效版本号：每次成功构建/迭代/回滚后 +1（与最新 Snapshot 对齐）
 	Version int `gorm:"not null;default:0" json:"version"`
 	// LastGoodHTML 最近一次通过校验并落库的产物（失败时保留的最后成功版本）
@@ -51,28 +51,28 @@ func (Event) TableName() string { return "events" }
 // Message 同一 project 的对话消息：每一轮（用户输入与对应助手回复）都保存为新记录，
 // 刷新/回看历史项目时按序还原完整对话。
 type Message struct {
-	ID        uint   `gorm:"primaryKey" json:"id"`
-	ProjectID uint   `gorm:"index" json:"projectId"`
-	UserID    uint   `gorm:"index" json:"userId"`
-	Role      string `gorm:"size:16" json:"role"`  // user | assistant
-	Kind      string `gorm:"size:16" json:"kind"`  // text（普通回复） | run（构建回合）
-	Text      string `gorm:"type:text" json:"text"` // 用户输入或助手文本回复
-	Status    string `gorm:"size:16" json:"status"` // run 消息的终态：done/failed/stopped
-	CreatedAtMs int64 `json:"createdAt"`
+	ID          uint   `gorm:"primaryKey" json:"id"`
+	ProjectID   uint   `gorm:"index" json:"projectId"`
+	UserID      uint   `gorm:"index" json:"userId"`
+	Role        string `gorm:"size:16" json:"role"`   // user | assistant
+	Kind        string `gorm:"size:16" json:"kind"`   // text（普通回复） | run（构建回合）
+	Text        string `gorm:"type:text" json:"text"` // 用户输入或助手文本回复
+	Status      string `gorm:"size:16" json:"status"` // run 消息的终态：done/failed/stopped
+	CreatedAtMs int64  `json:"createdAt"`
 }
 
 func (Message) TableName() string { return "messages" }
 
 // Attachment 用户上传的附件（图片走多模态识图，文本/代码直接注入上下文）。
 type Attachment struct {
-	ID         uint   `gorm:"primaryKey" json:"id"`
-	UserID     uint   `gorm:"index" json:"userId"`
-	Name       string `gorm:"size:255" json:"name"`
-	MimeType   string `gorm:"size:100" json:"mimeType"`
-	Size       int64  `json:"size"`
-	Content    string `gorm:"type:text" json:"-"` // 文本类内容原文
-	DataURL    string `gorm:"type:text" json:"-"` // 图片 dataURL（vision 模型用）
-	CreatedAtMs int64 `json:"createdAt"`
+	ID          uint   `gorm:"primaryKey" json:"id"`
+	UserID      uint   `gorm:"index" json:"userId"`
+	Name        string `gorm:"size:255" json:"name"`
+	MimeType    string `gorm:"size:100" json:"mimeType"`
+	Size        int64  `json:"size"`
+	Content     string `gorm:"type:text" json:"-"` // 文本类内容原文
+	DataURL     string `gorm:"type:text" json:"-"` // 图片 dataURL（vision 模型用）
+	CreatedAtMs int64  `json:"createdAt"`
 }
 
 func (Attachment) TableName() string { return "attachments" }
@@ -80,12 +80,12 @@ func (Attachment) TableName() string { return "attachments" }
 // Snapshot 一次成功构建/迭代的产物快照：版本回滚的真实数据源。
 // 每次产物通过校验并落库时创建（version 与 Project.Version 同步递增）。
 type Snapshot struct {
-	ID        uint   `gorm:"primaryKey" json:"id"`
-	ProjectID uint   `gorm:"index:idx_snap_proj_ver,unique" json:"projectId"`
-	Version   int    `gorm:"index:idx_snap_proj_ver,unique" json:"version"`
-	HTML      string `gorm:"type:text" json:"-"`
-	Label     string `gorm:"size:190" json:"label"` // 快照说明（首次构建 / 每轮迭代 / 回滚说明）
-	Status    string `gorm:"size:16" json:"status"` // done（成功版本才有快照）
+	ID          uint   `gorm:"primaryKey" json:"id"`
+	ProjectID   uint   `gorm:"index:idx_snap_proj_ver,unique" json:"projectId"`
+	Version     int    `gorm:"index:idx_snap_proj_ver,unique" json:"version"`
+	HTML        string `gorm:"type:text" json:"-"`
+	Label       string `gorm:"size:190" json:"label"` // 快照说明（首次构建 / 每轮迭代 / 回滚说明）
+	Status      string `gorm:"size:16" json:"status"` // done（成功版本才有快照）
 	CreatedAtMs int64  `json:"createdAt"`
 }
 
