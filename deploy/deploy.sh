@@ -71,10 +71,17 @@ if ! command -v nginx >/dev/null 2>&1; then
   apt-get update -qq && apt-get install -y -qq nginx
 fi
 
+DOMAIN=${ATOMIX_DOMAIN:-rxtxl.icu}
+LE_DIR=/etc/letsencrypt/live/$DOMAIN
 CERT_DIR=/etc/nginx/ssl
 CERT=$CERT_DIR/atomix.crt
 KEY=$CERT_DIR/atomix.key
-if [ ! -f "$CERT" ]; then
+# 优先使用 Let's Encrypt 正式证书（浏览器受信）；首次部署无证书时回落自签
+if [ -f "$LE_DIR/fullchain.pem" ]; then
+  CERT=$LE_DIR/fullchain.pem
+  KEY=$LE_DIR/privkey.pem
+  echo "==> 使用 Let's Encrypt 证书: $LE_DIR"
+elif [ ! -f "$CERT" ]; then
   echo "==> 生成自签 TLS 证书（有效期 10 年）…"
   mkdir -p $CERT_DIR
   openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
@@ -88,15 +95,18 @@ cat > /etc/nginx/conf.d/atomix.conf <<'NGINX'
 server {
     listen 80;
     server_name _;
-    return 301 https://$host$request_uri;
+    # ACME 验证路径（certbot webroot 续期依赖），其余跳转 HTTPS
+    location /.well-known/acme-challenge/ { root /var/www/acme; }
+    location / { return 301 https://$host$request_uri; }
 }
 server {
     listen 443 ssl http2;
     server_name _;
 
-    ssl_certificate     /etc/nginx/ssl/atomix.crt;
-    ssl_certificate_key /etc/nginx/ssl/atomix.key;
+    ssl_certificate     __CERT__;
+    ssl_certificate_key __KEY__;
     ssl_protocols TLSv1.2 TLSv1.3;
+    add_header Strict-Transport-Security "max-age=31536000" always;
 
     # SSE 反代必需：关闭缓冲，保持长连接
     proxy_http_version 1.1;
@@ -114,6 +124,8 @@ server {
     }
 }
 NGINX
+mkdir -p /var/www/acme
+sed -i "s|__CERT__|$CERT|; s|__KEY__|$KEY|" /etc/nginx/conf.d/atomix.conf
 
 # 释放 80 端口：容器已不再直接占用；同时禁用 Ubuntu 默认站点（抢占 80 导致跳转失效）
 rm -f /etc/nginx/sites-enabled/default
