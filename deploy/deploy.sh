@@ -7,13 +7,15 @@ APP_DIR=/opt/atomix-demo
 DATA_DIR=/opt/atomix-data
 ENV_FILE=$APP_DIR/.env
 CONTAINER=atomix-demo
-GIT_SHA=$(cd $APP_DIR && git rev-parse --short HEAD)
 
-echo "==> 当前部署提交: $GIT_SHA"
-
-cd $APP_DIR
 echo "==> 拉取最新代码…"
+cd $APP_DIR
 git pull --ff-only
+
+# SHA 必须在 pull 之后取：取早了会把上一次部署的 SHA 标进本次镜像与 .env，
+# 健康检查显示旧值（#e16 遗留问题的根因）
+GIT_SHA=$(git rev-parse --short HEAD)
+echo "==> 当前部署提交: $GIT_SHA"
 
 # ---------- JWT 密钥安全检查：拒绝默认密钥进入任何模式 ----------
 if [ ! -f "$ENV_FILE" ]; then
