@@ -6,7 +6,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"atomix-demo/server/internal/store"
 
@@ -31,8 +30,8 @@ func openMutexTestDB(t *testing.T) {
 }
 
 // TestRun_HoldsProjectLock Run 执行期间项目锁被持有：并发的 TryLockProject 必须失败。
-// 用一个慢 LLM 不需要——mock 模式的 Run 很快，因此在 Run 内部短暂阻塞：
-// 这里用 ctx 取消让 Run 提前结束的方式验证锁在 Run 生命周期内被持有。
+// mock Run 也很快，为了确保断言一定执行（而非轮询碰巧错过），用 OnStage 回调在
+// Run 内部「构建中」时刻发起 TryLock：此刻 Run 必然持有锁，断言不依赖时序运气。
 func TestRun_HoldsProjectLock(t *testing.T) {
 	openMutexTestDB(t)
 	ag := NewAgent(nil, true)
@@ -42,35 +41,31 @@ func TestRun_HoldsProjectLock(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	var tryLockFailed int32
+	probed := make(chan struct{}, 1)
 
 	go func() {
 		defer close(done)
-		_, _ = ag.Run(ctx, uid, "做一个待办清单", "build", nil, PipelineEvents{})
+		_, _ = ag.Run(ctx, uid, "做一个待办清单", "build", nil, PipelineEvents{
+			// act 阶段首个事件必然发生在锁持有期内（runProject 建行后立即持锁再跑循环）
+			OnStage: func(stage, message string) {
+				select {
+				case probed <- struct{}{}:
+				default:
+					return // 只探第一次
+				}
+				var p store.Project
+				if err := store.DB.Where("user_id = ?", uid).First(&p).Error; err != nil {
+					return
+				}
+				if _, ok := ag.TryLockProject(p.ID); !ok {
+					atomic.StoreInt32(&tryLockFailed, 1)
+				}
+			},
+		})
 	}()
 
-	// 轮询等待项目行落库（Run 一开始就建行），随即验证锁已被 Run 持有
-	deadline := time.Now().Add(3 * time.Second)
-	locked := false
-	for time.Now().Before(deadline) {
-		var cnt int64
-		store.DB.Model(&store.Project{}).Where("user_id = ?", uid).Count(&cnt)
-		if cnt > 0 {
-			// 项目行已建：此刻锁应被 Run 持有（TryLock 应失败）
-			var p store.Project
-			store.DB.Where("user_id = ?", uid).First(&p)
-			if _, ok := ag.TryLockProject(p.ID); !ok {
-				atomic.StoreInt32(&tryLockFailed, 1)
-				locked = true
-				cancel() // 验证完成，让 Run 尽快收尾
-				break
-			}
-			// 极小概率 Run 已完成（mock 很快）：此时锁已释放，跳过断言
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
 	<-done
-	if locked && atomic.LoadInt32(&tryLockFailed) == 0 {
+	if atomic.LoadInt32(&tryLockFailed) == 0 {
 		t.Error("Run 运行中 TryLockProject 不应成功（Run 应持有项目锁）")
 	}
 }

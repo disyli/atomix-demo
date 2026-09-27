@@ -505,7 +505,11 @@ function readAppData(projectId) {
 
 function onShimMessage(e) {
   const d = e.data
+  // 消息必须来自当前预览 iframe 的窗口：其他窗口（如恶意页面 window.open 的引用）
+  // 伪造 atomix-shim 消息会污染当前项目的应用数据，凭 e.source 精确拒绝
+  const frame = previewFrameRef.value
   if (!d || d.source !== 'atomix-shim' || !activeProject.value) return
+  if (!frame || e.source !== frame.contentWindow) return
   if (d.type === 'storage') {
     const key = APP_DATA_PREFIX + activeProject.value.id
     let data = {}
@@ -562,6 +566,8 @@ watch(rightTab, (v) => { if (v === 'code' && !codeView.value.source && activePro
 
 /* ---------- 版本管理（快照列表 + 回滚） ---------- */
 const versionView = ref({ loading: false, current: 0, snapshots: [], rolling: 0, notice: '' })
+// 预览 iframe 引用：onShimMessage 校验消息来源必须是这个窗口（防其他窗口伪造 storage 消息）
+const previewFrameRef = ref(null)
 
 // 拉取当前项目的成功版本快照列表（version DESC）
 async function loadSnapshots() {
@@ -959,6 +965,7 @@ onBeforeUnmount(() => {
             </div>
             <iframe
               v-if="previewUrl"
+              ref="previewFrameRef"
               :src="previewUrl"
               sandbox="allow-scripts allow-forms allow-modals"
               class="preview-frame"

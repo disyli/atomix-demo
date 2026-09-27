@@ -39,8 +39,10 @@ export const api = {
   // 迭代修改：在已有项目上追加自然语言修改指令（后端走 ReAct 循环）
   refine: (id, instruction) => request('/api/projects/' + id + '/refine', { method: 'POST', body: JSON.stringify({ instruction }) }),
   // 签发预览凭据：服务端设置 HttpOnly Cookie（1 小时），iframe/新窗口同源自动携带；
-  // 返回的 ticket 仅用于 SSE（EventSource 走 query 参数）
+  // 返回的 60s ticket 仅用于 SSE（EventSource 走 query 参数，短有效期防日志泄漏复用）
   issueTicket: () => request('/api/ticket', { method: 'POST', body: '{}' }),
+  // 退出登录：清 localStorage 之外还请求服务端清除 HttpOnly 预览 Cookie
+  logout: () => request('/api/auth/logout', { method: 'POST', body: '{}' }),
   // 预览 URL：无需任何凭据参数（HttpOnly Cookie 自动附带），URL 干净、不过期、不进访问日志
   previewUrl: async (id, payload) => {
     try { await request('/api/ticket', { method: 'POST', body: '{}' }) } catch {}

@@ -77,11 +77,16 @@ func Register(r *gin.Engine, h *Handlers) {
 	// ticket：为 preview/download/generate 等需要在 URL query 传凭据的场景签发短期令牌（60s），
 	// 避免长期 token 写入 nginx 访问日志
 	authed.POST("/ticket", h.issueTicket)
+	// 退出：清除 HttpOnly 预览 Cookie，防止公用电脑退出后旧凭据继续可用
+	authed.POST("/auth/logout", h.logout)
 
 	// 票据验证路由（不在 authed 组，只接受 ticket 或 Bearer）
 	tb := ticketOrBearer(h.Cfg.JWTSecret, h.Cfg.TicketSecret)
 	r.GET("/api/generate", tb, h.generateSSE)
-	r.GET("/api/projects/:id/source", tb, h.projectSource)
+	// 源码（预览面板 JSON + 下载附件）与预览共用 Cookie 鉴权：
+	// 浏览器直接访问（iframe src、<a download>、新窗口）自动带同源 Cookie，URL 不含凭据；
+	// previewCookie 内置 query ticket 回落（60s 短票据，兼容 API 直调/旧链接）
+	r.GET("/api/projects/:id/source", previewCookie(h.Cfg.TicketSecret), h.projectSource)
 
 	// 预览专用：HttpOnly Cookie 鉴权（iframe 与新窗口同源自动携带，无 60s 过期问题，
 	// 也不会把任何凭据写进 URL/访问日志；CSP sandbox 头保证新窗口与 iframe 同样隔离）
@@ -709,32 +714,55 @@ func (h *Handlers) refineSSE(c *gin.Context) {
 	send("done", toJSON(gin.H{"project": projectBrief(*updated), "runId": runID}))
 }
 
-// issueTicket 为预览签发凭据。v2 起改为 HttpOnly 会话 Cookie（服务端 1 小时有效）：
-// iframe/新窗口同源自动携带，URL 里不再出现任何凭据，也不存在 60s 过期导致的
-// 「预览刷新即 401」问题。SSE（generate）仍用 query ticket（EventSource 无法带 Cookie 之外的
-// 头，且 SSE 生命周期短）。保留 JSON 返回 ticket 供 SSE 使用。
+// issueTicket 为预览与下载签发凭据。v2 起预览/下载走 HttpOnly 会话 Cookie（服务端 1 小时有效）：
+// iframe/新窗口/下载链接同源自动携带，URL 里不出现任何凭据。SSE（generate）仍用 query ticket
+// （EventSource 无法带自定义头），但单独签发 60 秒短票据——JSON 返回的凭据只活 60 秒，
+// 即使进入 nginx 访问日志也几乎不可复用；Cookie 凭据（1 小时）不进任何 URL。
 func (h *Handlers) issueTicket(c *gin.Context) {
 	uid := middleware.UID(c)
 	email := c.GetString("email")
-	ticket, err := auth.IssueTicketTTL(h.Cfg.TicketSecret, uid, email, time.Hour)
+	// SSE 专用 60s 短票据：仅进 JSON 响应体，不进 URL，不写 Cookie
+	sseTicket, err := auth.IssueTicket(h.Cfg.TicketSecret, uid, email)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "签发票据失败"})
 		return
 	}
-	// 预览凭据走 Cookie：HttpOnly（JS 不可读）+ SameSite=Lax（iframe 同源导航携带）
-	// + Session（关浏览器即清）。1 小时后过期，前端 setActiveProject 时会重新签发。
+	// 预览/下载凭据走 Cookie：与 SSE 票据分开签发（互不影响有效期）。
+	// HttpOnly（JS 不可读）+ SameSite=Lax（同源导航自动携带）+ Secure（仅 HTTPS 传输）
+	// + Session 语义（关浏览器即清）。1 小时后过期，前端 setActiveProject 时会重新签发。
+	cookieTicket, err := auth.IssueTicketTTL(h.Cfg.TicketSecret, uid, email, time.Hour)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "签发票据失败"})
+		return
+	}
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     "atomix_preview",
-		Value:    ticket,
+		Value:    cookieTicket,
 		Path:     "/api/projects",
 		MaxAge:   3600,
 		HttpOnly: true,
+		Secure:   true,
 		SameSite: http.SameSiteLaxMode,
 	})
-	c.JSON(http.StatusOK, gin.H{"ticket": ticket, "ttl": 60})
+	c.JSON(http.StatusOK, gin.H{"ticket": sseTicket, "ttl": 60})
 }
 
-// previewCookie 预览路由专用鉴权：读取 atomix_preview Cookie（票据密钥签名、Use=ticket、
+// logout 清除预览 Cookie：退出登录时立即失效 HttpOnly 凭据。
+// 公用电脑场景下，退出后 1 小时内他人不可再用旧 Cookie 直开预览/下载地址。
+func (h *Handlers) logout(c *gin.Context) {
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     "atomix_preview",
+		Value:    "",
+		Path:     "/api/projects",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// previewCookie 预览/源码路由专用鉴权：读取 atomix_preview Cookie（票据密钥签名、Use=ticket、
 // 1 小时有效）。不设置 Cookie 时为兼容期回落到 query ticket（60s，仅存量链接）。
 func previewCookie(ticketSecret string) gin.HandlerFunc {
 	return func(c *gin.Context) {

@@ -13,6 +13,8 @@ const firstName = computed(() => {
   return n.length > 12 ? n.slice(0, 12) : n
 })
 function logout() {
+  // 先清服务端 HttpOnly 预览 Cookie（公用电脑防残留），失败也继续本地登出
+  api.logout().catch(() => {})
   localStorage.removeItem('atomix_token')
   localStorage.removeItem('atomix_user')
   router.push('/login')

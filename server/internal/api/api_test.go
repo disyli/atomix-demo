@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -167,6 +168,122 @@ func TestPreview_OtherUsersProject(t *testing.T) {
 	if w2.Code != http.StatusNotFound {
 		t.Errorf("访问他人项目预览应 404，得到 %d", w2.Code)
 	}
+}
+
+// ---------- 票据拆分：JSON 票据 60s、Cookie 票据 1h，二者独立 ----------
+
+func TestIssueTicket_TTLSplit(t *testing.T) {
+	r, tok, _ := newTestApp(t)
+	w := doJSON(r, "POST", "/api/ticket", tok, "{}")
+	if w.Code != http.StatusOK {
+		t.Fatalf("issueTicket: %d", w.Code)
+	}
+	var body struct{ Ticket string }
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body.Ticket == "" {
+		t.Fatalf("ticket 响应解析失败: %v %s", err, w.Body.String())
+	}
+	// JSON 票据必须约 60s（防止长凭据进 SSE URL/访问日志）
+	sseClaims, err := auth.ParseToken(testTicketSecret, body.Ticket)
+	if err != nil {
+		t.Fatalf("JSON ticket 解析失败: %v", err)
+	}
+	remain := time.Until(sseClaims.ExpiresAt.Time)
+	if remain > 61*time.Second || remain < 59*time.Second {
+		t.Errorf("JSON ticket 应约 60s，实际剩余 %v", remain)
+	}
+	// Cookie 票据必须约 1h（预览会话时长）
+	ck := strings.Split(w.Header().Get("Set-Cookie"), ";")[0]
+	ckVal := strings.TrimPrefix(ck, "atomix_preview=")
+	ckClaims, err := auth.ParseToken(testTicketSecret, ckVal)
+	if err != nil {
+		t.Fatalf("cookie ticket 解析失败: %v", err)
+	}
+	ckRemain := time.Until(ckClaims.ExpiresAt.Time)
+	if ckRemain > 61*time.Minute || ckRemain < 59*time.Minute {
+		t.Errorf("Cookie ticket 应约 1h，实际剩余 %v", ckRemain)
+	}
+	// Cookie 属性：HttpOnly + Secure + SameSite=Lax
+	setCookie := w.Header().Get("Set-Cookie")
+	if !strings.Contains(setCookie, "HttpOnly") || !strings.Contains(setCookie, "Secure") || !strings.Contains(setCookie, "SameSite=Lax") {
+		t.Errorf("Set-Cookie 应含 HttpOnly/Secure/SameSite=Lax，实际: %s", setCookie)
+	}
+	// 两张票据互不相同
+	if body.Ticket == ckVal {
+		t.Error("JSON ticket 与 Cookie ticket 应分开签发（不同 jti）")
+	}
+}
+
+// ---------- 下载：Cookie 鉴权可用、无凭据 401、60s ticket 回落可用 ----------
+
+func TestSourceDownload_AuthPaths(t *testing.T) {
+	r, tok, uid := newTestApp(t)
+	pid := createReadyProject(t, uid, "<html><body>ok</body></html>")
+
+	// 无凭据：401
+	w := doJSON(r, "GET", fmt.Sprintf("/api/projects/%d/source?download=1", pid), "", "")
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("无凭据下载应 401，得到 %d", w.Code)
+	}
+
+	// 签发票据后仅凭 Cookie 下载：200 + 附件头（浏览器 <a download> 的真实路径）
+	wt := doJSON(r, "POST", "/api/ticket", tok, "{}")
+	if wt.Code != http.StatusOK {
+		t.Fatalf("issueTicket: %d", wt.Code)
+	}
+	cookie := strings.Split(wt.Header().Get("Set-Cookie"), ";")[0]
+	req := httptest.NewRequest("GET", fmt.Sprintf("/api/projects/%d/source?download=1", pid), nil)
+	req.Header.Set("Cookie", cookie)
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("Cookie 下载应 200，得到 %d %s", w2.Code, w2.Body.String())
+	}
+	if cd := w2.Header().Get("Content-Disposition"); !strings.Contains(cd, "attachment") {
+		t.Errorf("下载应带 attachment 头，实际: %q", cd)
+	}
+	if !strings.Contains(w2.Body.String(), "ok") {
+		t.Errorf("下载应返回源码正文")
+	}
+
+	// JSON 返回的 60s ticket 走 query（API 直调兼容路径）：同样可用
+	var body struct{ Ticket string }
+	json.Unmarshal(wt.Body.Bytes(), &body)
+	w3 := doJSON(r, "GET", fmt.Sprintf("/api/projects/%d/source?download=1&ticket=%s", pid, body.Ticket), "", "")
+	if w3.Code != http.StatusOK {
+		t.Errorf("query ticket 下载应 200，得到 %d", w3.Code)
+	}
+}
+
+// ---------- 退出登录：HttpOnly Cookie 必须被清除 ----------
+
+func TestLogout_ClearsPreviewCookie(t *testing.T) {
+	r, tok, uid := newTestApp(t)
+	pid := createReadyProject(t, uid, "<html>ok</html>")
+
+	// 先签发拿到 Cookie，确认可用
+	wt := doJSON(r, "POST", "/api/ticket", tok, "{}")
+	cookie := strings.Split(wt.Header().Get("Set-Cookie"), ";")[0]
+	req := httptest.NewRequest("GET", fmt.Sprintf("/api/projects/%d/preview", pid), nil)
+	req.Header.Set("Cookie", cookie)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("签发后预览应 200，得到 %d", w.Code)
+	}
+
+	// 退出：Set-Cookie MaxAge=-1
+	wl := doJSON(r, "POST", "/api/auth/logout", tok, "{}")
+	if wl.Code != http.StatusOK {
+		t.Fatalf("logout: %d", wl.Code)
+	}
+	clear := wl.Header().Get("Set-Cookie")
+	if !strings.Contains(clear, "atomix_preview=") || !strings.Contains(clear, "Max-Age=0") {
+		t.Fatalf("logout 应下发清 Cookie 头（MaxAge=-1），实际: %s", clear)
+	}
+
+	// 旧 Cookie 值再次使用仍被服务端拒收？——注意：票据是自包含 JWT，服务端无会话表，
+	// 清 Cookie 只是让浏览器丢弃；未过期的旧值技术上仍有效。这是 JWT 的固有属性，
+	// 防御目标是「浏览器不再自动携带」，此测试验证清 Cookie 头下发正确即达标。
 }
 
 // ---------- 邮箱校验与规范化 ----------
