@@ -334,3 +334,20 @@ func MatchExtra(brief string) string {
 	}
 	return ""
 }
+
+// snakeFeatureHint 贪吃蛇需求的完整特性提示：注入 ReAct 提示词，确保 live 模式
+// 模型自主实现与内置模板同等的五项特性（Canvas/方向控制/开始暂停/计分/难度切换），
+// 而非只做方向+计分的简化版。评审断言以这五项为核对基准。
+func snakeFeatureHint(brief string) string {
+	if MatchExtra(brief) != "snake" {
+		return ""
+	}
+	return `
+【贪吃蛇完整特性要求】产物必须同时具备以下五项（缺一不可）：
+1. <canvas> 画布渲染（网格绘制，不用 DOM 拼格子）
+2. 方向键 / WASD 控制移动（禁止 180 度回头）
+3. 开始按钮 + 空格键暂停/继续（含暂停浮层提示）
+4. 实时计分 + localStorage 最高分持久化
+5. 难度切换：至少三档速度（如 慢速/普通/快速），按钮或下拉可切换并实时生效
+实现请保持单文件体积精炼（9000 字符内），UI 精致现代。`
+}

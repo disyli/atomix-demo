@@ -94,7 +94,7 @@ func reactPrompt(brief, refineTo, mode string) string {
 	if refineTo != "" {
 		sb.WriteString("\n\n本次任务是在已有应用上做迭代修改。当前产物会通过 read_file 提供，优先用 edit_file 最小化修改；确需整体重构时才 write_file 完整文档。")
 	} else {
-		sb.WriteString("\n\n用户需求：" + brief)
+		sb.WriteString("\n\n用户需求：" + brief + snakeFeatureHint(brief))
 	}
 	return sb.String()
 }
