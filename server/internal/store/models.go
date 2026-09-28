@@ -11,8 +11,11 @@ type User struct {
 	ID           uint   `gorm:"primaryKey" json:"id"`
 	Email        string `gorm:"uniqueIndex;size:190" json:"email"`
 	PasswordHash string `json:"-"`
-	CreatedAtMs  int64  `json:"createdAt"`
-	UpdatedAtMs  int64  `json:"updatedAt"`
+	// TokenVersion 令牌版本号：退出登录时 +1，之前签发的所有 JWT（claims.tv 为旧版本号）
+	// 立即失效，无需等待 7 天自然过期。默认 0，新用户与历史用户均从 0 起步。
+	TokenVersion int   `gorm:"not null;default:0" json:"-"`
+	CreatedAtMs  int64 `json:"createdAt"`
+	UpdatedAtMs  int64 `json:"updatedAt"`
 }
 
 func (User) TableName() string { return "users" }
@@ -202,7 +205,44 @@ func CommitSuccess(projectID uint, html, label, doneEventMsg, summary, brief str
 	return out, err
 }
 
+// CommitFailure 失败/停止终态的单一事务原子提交：与 CommitSuccess 对称，修复
+// 原实现"状态、事件、消息分三步写库且不检查错误"的缺口（进程崩溃可能出现
+// status=failed 但缺失事件或消息的中间态）。同一事务内完成：
+//  1. Project：status=status，keepHTML 时 HTML 回退到 LastGoodHTML（保留最后成功版本）
+//  2. Event：终态事件（stage=done，供时间线展示失败/停止原因）
+//  3. Message：assistant run 消息（status 为 failed/stopped，对话回看依据）
+// 任一步失败整体回滚并原样返回 error，调用方需自行决定重试或放弃（不会出现部分落库）。
+func CommitFailure(projectID uint, status, eventMsg, level string, keepHTML bool, brief string, userID uint) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var p Project
+		if err := tx.Where("id = ?", projectID).First(&p).Error; err != nil {
+			return err
+		}
+		now := Now()
+		updates := map[string]interface{}{"status": status, "updated_at_ms": now}
+		if keepHTML && p.LastGoodHTML != "" {
+			updates["html"] = p.LastGoodHTML
+		}
+		if err := tx.Model(&Project{}).Where("id = ?", projectID).Updates(updates).Error; err != nil {
+			return err
+		}
+		if eventMsg != "" {
+			if err := tx.Create(&Event{ProjectID: projectID, Stage: "done", Message: eventMsg, Level: level, TsMs: now}).Error; err != nil {
+				return err
+			}
+		}
+		if brief != "" {
+			if err := tx.Create(&Message{ProjectID: projectID, UserID: userID, Role: "assistant", Kind: "run", Text: brief, Status: status, CreatedAtMs: now}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // MarkProjectStatus 事务内更新项目状态与 LastGoodHTML（失败/停止时保留最后成功版本）。
+// 单独调用场景已收窄：仅 CommitFailure 内部与極少数不需要事件/消息的路径使用；
+// 失败终态请优先使用 CommitFailure 保证状态+事件+消息原子一致。
 func MarkProjectStatus(projectID uint, status string, keepHTML bool) error {
 	return DB.Transaction(func(tx *gorm.DB) error {
 		var p Project
@@ -223,6 +263,37 @@ func ListSnapshots(projectID uint) ([]Snapshot, error) {
 	var ss []Snapshot
 	err := DB.Where("project_id = ? AND status = ?", projectID, "done").Order("version DESC").Find(&ss).Error
 	return ss, err
+}
+
+// IsTokenRevoked 判断给定用户的 token 版本号是否已被吊销：tv 落后于库内当前
+// TokenVersion 即视为已吊销（用户已退出登录或版本号被主动升级）。
+// 查询失败（如用户已被删除）或 DB 未初始化时保守返回 true（拒绝访问，不 panic）：
+// 中间件因此只会多返回一次 401，绝不会因为 store.DB 为 nil 而使进程崩溃。
+func IsTokenRevoked(userID uint, tv int) bool {
+	if DB == nil {
+		return true
+	}
+	var u User
+	if err := DB.Select("token_version").Where("id = ?", userID).First(&u).Error; err != nil {
+		return true
+	}
+	return tv < u.TokenVersion
+}
+
+// RevokeUserTokens 退出登录：TokenVersion+1，之前签发的所有 token（tv 为旧版本号）
+// 立即失效。返回递增后的新版本号，供调用方立即签发新 token（如需要）。
+func RevokeUserTokens(userID uint) (int, error) {
+	var newVersion int
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var u User
+		if err := tx.Where("id = ?", userID).First(&u).Error; err != nil {
+			return err
+		}
+		newVersion = u.TokenVersion + 1
+		return tx.Model(&User{}).Where("id = ?", userID).
+			Updates(map[string]interface{}{"token_version": newVersion, "updated_at_ms": Now()}).Error
+	})
+	return newVersion, err
 }
 
 // DB 持有全局 gorm 实例。

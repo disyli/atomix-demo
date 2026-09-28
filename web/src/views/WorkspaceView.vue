@@ -7,9 +7,15 @@ const user = computed(() => {
   try { return JSON.parse(localStorage.getItem('atomix_user') || '{}') } catch { return {} }
 })
 function logout() {
-  localStorage.removeItem('atomix_token')
-  localStorage.removeItem('atomix_user')
-  location.href = '/login'
+  // 先请求服务端吊销 token（TokenVersion+1）并清预览 Cookie，再清本地状态并跳转。
+  // 即使请求失败（网络问题）也继续清本地状态，避免用户卡在退出流程里；
+  // 但服务端吊销失败时旧 token 在其 7 天有效期内仍可能被复用，这与登录页/仪表盘的
+  // 退出行为保持一致（均调用同一后端接口，不因请求失败而阻塞前端退出）。
+  api.logout().catch(() => {}).finally(() => {
+    localStorage.removeItem('atomix_token')
+    localStorage.removeItem('atomix_user')
+    location.href = '/login'
+  })
 }
 
 /* ---------- 全局状态 ---------- */
@@ -61,9 +67,9 @@ const procOpen = reactive({})
 function newUserMsg(text) {
   return { id: 'u' + (++seq), role: 'user', text, ts: Date.now() }
 }
-function newRunMsg(brief) {
+function newRunMsg(brief, attachIds = []) {
   return {
-    id: 'r' + (++seq), role: 'assistant', brief,
+    id: 'r' + (++seq), role: 'assistant', brief, attachIds,
     stageState: Object.fromEntries(stages.map(s => [s, 'pending'])),
     currentStage: '',
     events: [],
@@ -204,6 +210,23 @@ function failRun(run, text) {
   autoscroll()
 }
 
+// retryRun 失败卡片“重试”按钮：用原始 brief 与 attachIds 重新发起，不新增一条用户消息
+// （已有的用户消息保留原样，只是本轮结果被替换）。有 projectId 走迭代修改（refineSend），
+// 否则视为新建构建失败，走 generateSend 重新走一次构建流水线。
+function retryRun(run) {
+  if (running.value) return
+  const idx = thread.value.indexOf(run)
+  if (idx !== -1) thread.value.splice(idx, 1)
+  const attachIds = run.attachIds || []
+  running.value = true
+  if (run.projectId) {
+    setActiveProject({ id: run.projectId, name: run.projectName })
+    refineSend(run.brief, true, attachIds)
+  } else {
+    generateSend(run.brief, true, attachIds)
+  }
+}
+
 // finishStopped 服务端 stopped 事件到达时的回合收尾（幂等，避免与 stopRun 本地收尾重复）
 function finishStopped(run) {
   if (run.status !== 'running') return
@@ -300,7 +323,7 @@ async function classify(text, attachIds = [], m = 'build') {
 
 function generateSend(text, alreadyRouted, attachIds = []) {
   if (!alreadyRouted) { running.value = true; thread.value.push(newUserMsg(text)) }
-  const run = reactive(newRunMsg(text))
+  const run = reactive(newRunMsg(text, attachIds))
   thread.value.push(run)
   scrollToBottom()
 
@@ -411,7 +434,7 @@ async function recoverRun(run) {
 async function refineSend(text, alreadyRouted, attachIds = []) {
   if (!alreadyRouted) { running.value = true; thread.value.push(newUserMsg(text)) }
   const pid = activeProject.value.id
-  const run = reactive(newRunMsg(text))
+  const run = reactive(newRunMsg(text, attachIds))
   thread.value.push(run)
   scrollToBottom()
   try {
@@ -877,7 +900,10 @@ onBeforeUnmount(() => {
                   <span>{{ m.summary }}</span>
                   <button v-if="m.projectId" class="view-btn" @click="rightTab = 'preview'">查看应用 →</button>
                 </div>
-                <div v-if="m.status === 'failed'" class="run-error">{{ m.errorText }}</div>
+                <div v-if="m.status === 'failed'" class="run-error">
+                  <span>{{ m.errorText }}</span>
+                  <button class="retry-btn" :disabled="running" @click="retryRun(m)">重试</button>
+                </div>
               </div>
             </div>
           </template>
@@ -1254,7 +1280,15 @@ onBeforeUnmount(() => {
 .run-error {
   margin-top: 10px; font-size: 13px; color: var(--red);
   background: rgba(193, 74, 80, .08); border-radius: 8px; padding: 9px 12px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
 }
+.retry-btn {
+  color: var(--red); font-weight: 600; font-size: 12.5px;
+  border: 1px solid rgba(193, 74, 80, .35); border-radius: 8px;
+  padding: 5px 13px; background: var(--paper-50); transition: all .18s ease; flex-shrink: 0;
+}
+.retry-btn:hover:not(:disabled) { background: rgba(193, 74, 80, .14); border-color: var(--red); }
+.retry-btn:disabled { opacity: .5; cursor: not-allowed; }
 
 /* ============ 底部输入区 ============ */
 .composer { flex-shrink: 0; padding: 10px 22px 16px; }

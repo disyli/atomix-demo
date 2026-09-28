@@ -375,6 +375,17 @@ func TestStoreOpen_CleansGeneratingProjects(t *testing.T) {
 	if readyCnt != 1 {
 		t.Errorf("ready 项目不应被影响，期望 1 个，实际 %d 个", readyCnt)
 	}
+	// 修复点：补写失败事件与消息，避免"状态已 failed 但时间线/对话历史缺失说明"的中间态
+	var evtCnt int64
+	store.DB.Model(&store.Event{}).Where("project_id = ? AND stage = ?", zombie.ID, "done").Count(&evtCnt)
+	if evtCnt != 1 {
+		t.Errorf("重启清理应为僵尸项目补写 1 条 done 事件，实际 %d 条", evtCnt)
+	}
+	var readyEvtCnt int64
+	store.DB.Model(&store.Event{}).Where("project_id = ?", ready.ID).Count(&readyEvtCnt)
+	if readyEvtCnt != 0 {
+		t.Errorf("ready 项目不应被补写任何事件，实际 %d 条", readyEvtCnt)
+	}
 }
 
 // ---------- 综合回归：多账号数据隔离全链路 ----------

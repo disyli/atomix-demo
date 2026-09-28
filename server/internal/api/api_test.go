@@ -154,8 +154,15 @@ func TestPreview_CookieExpired(t *testing.T) {
 func TestPreview_OtherUsersProject(t *testing.T) {
 	r, _, uid := newTestApp(t)
 	pid := createReadyProject(t, uid, "<html>ok</html>")
-	// 另一个用户（同密钥签发）带合法 Cookie 访问别人项目
-	other, _ := auth.IssueToken(testJWTSecret, uid+1, "other@t.test")
+	// 另一个真实用户（需先落库，否则 issueTicket 时 UserIdentity 的 token 版本号
+	// 校验查不到该用户会直接 401，测试意图是验证"真实用户访问别人项目 404"而非
+	// "虚构用户连预览凭据都拿不到"）
+	hash, _ := auth.HashPassword("pass123456")
+	otherUser := &store.User{Email: "other@t.test", PasswordHash: hash, CreatedAtMs: store.Now(), UpdatedAtMs: store.Now()}
+	if err := store.DB.Create(otherUser).Error; err != nil {
+		t.Fatalf("create other user: %v", err)
+	}
+	other, _ := auth.IssueToken(testJWTSecret, otherUser.ID, otherUser.Email)
 	w := doJSON(r, "POST", "/api/ticket", other, "{}")
 	if w.Code != http.StatusOK {
 		t.Fatalf("issueTicket: %d", w.Code)
@@ -281,9 +288,45 @@ func TestLogout_ClearsPreviewCookie(t *testing.T) {
 		t.Fatalf("logout 应下发清 Cookie 头（MaxAge=-1），实际: %s", clear)
 	}
 
-	// 旧 Cookie 值再次使用仍被服务端拒收？——注意：票据是自包含 JWT，服务端无会话表，
-	// 清 Cookie 只是让浏览器丢弃；未过期的旧值技术上仍有效。这是 JWT 的固有属性，
-	// 防御目标是「浏览器不再自动携带」，此测试验证清 Cookie 头下发正确即达标。
+	// 旧 token 立即失效：TokenVersion+1 后旧 token 的 tv 落后，/api/me 应 401
+	// （此前 JWT 无版本号机制，退出后旧 token 在 7 天有效期内仍可复用，是已确认缺陷）
+	wme := doJSON(r, "GET", "/api/me", tok, "")
+	if wme.Code != http.StatusUnauthorized {
+		t.Errorf("logout 后旧 token 应立即失效（401），得到 %d", wme.Code)
+	}
+}
+
+// TestLogout_RevokesTokenImmediately 退出登录后旧 token 在其自然有效期内也不可再用，
+// 覆盖 UserIdentity（Bearer）与 ticketOrBearer 两条鉴权路径。
+func TestLogout_RevokesTokenImmediately(t *testing.T) {
+	r, tok, _ := newTestApp(t)
+	// 退出前：正常可用
+	if w := doJSON(r, "GET", "/api/projects", tok, ""); w.Code != http.StatusOK {
+		t.Fatalf("退出前应可正常访问，得到 %d", w.Code)
+	}
+	if w := doJSON(r, "POST", "/api/auth/logout", tok, "{}"); w.Code != http.StatusOK {
+		t.Fatalf("logout: %d", w.Code)
+	}
+	// 退出后：同一 token 访问任意 authed 接口均 401
+	if w := doJSON(r, "GET", "/api/projects", tok, ""); w.Code != http.StatusUnauthorized {
+		t.Errorf("退出后旧 token 访问 /api/projects 应 401，得到 %d", w.Code)
+	}
+	if w := doJSON(r, "POST", "/api/ticket", tok, "{}"); w.Code != http.StatusUnauthorized {
+		t.Errorf("退出后旧 token 签发 ticket 应 401，得到 %d", w.Code)
+	}
+	// 重新登录应拿到新 token（新版本号），且新 token 立即可用
+	// 复用 newTestApp 内注册的账号密码
+	wl := doJSON(r, "POST", "/api/auth/login", "", `{"email":"owner@t.test","password":"pass123456"}`)
+	if wl.Code != http.StatusOK {
+		t.Fatalf("重新登录应成功: %d %s", wl.Code, wl.Body.String())
+	}
+	var body struct{ Token string }
+	if err := json.Unmarshal(wl.Body.Bytes(), &body); err != nil || body.Token == "" {
+		t.Fatalf("登录响应解析失败: %v", err)
+	}
+	if w := doJSON(r, "GET", "/api/projects", body.Token, ""); w.Code != http.StatusOK {
+		t.Errorf("重新登录的新 token 应立即可用，得到 %d", w.Code)
+	}
 }
 
 // ---------- 邮箱校验与规范化 ----------

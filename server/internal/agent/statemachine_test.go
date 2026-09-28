@@ -502,3 +502,83 @@ END`).Error; err != nil {
 	}
 }
 
+// TestCommitFailureAtomicity 失败终态事务原子性：Event 表插入被 trigger 强制失败时，
+// CommitFailure 必须整体回滚——项目状态不得变化、Message 也不得落库。修复此前
+// "状态、事件、消息分三步写库且不检查错误"的缺口（可能出现 status=failed 但
+// 缺失事件/消息的中间态）。
+func TestCommitFailureAtomicity(t *testing.T) {
+	openTestDB(t)
+	uid := newTestUser(t)
+	p := &store.Project{UserID: uid, Name: "旧项目", Brief: "b", Template: "todo",
+		HTML: validHTML, LastGoodHTML: validHTML, Status: "generating", Version: 1,
+		CreatedAtMs: store.Now(), UpdatedAtMs: store.Now()}
+	if err := store.DB.Create(p).Error; err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	// 在 events 表上装 trigger：拦截 stage=done 的插入（模拟事件落库崩溃）
+	if err := store.DB.Exec(`CREATE TRIGGER block_done_event BEFORE INSERT ON events
+WHEN NEW.stage = 'done'
+BEGIN
+  SELECT RAISE(ABORT, 'simulated event write failure');
+END`).Error; err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err := store.CommitFailure(p.ID, "failed", "构建失败: 模拟错误", "err", true, "某次修改指令", uid)
+	if err == nil {
+		t.Fatal("事件写入失败时 CommitFailure 必须返回错误")
+	}
+
+	var reloaded store.Project
+	store.DB.Where("id = ?", p.ID).First(&reloaded)
+	if reloaded.Status != "generating" {
+		t.Fatalf("事务回滚后项目状态不应变化（应保持 generating），实际 %s", reloaded.Status)
+	}
+	var msgCount int64
+	store.DB.Model(&store.Message{}).Where("project_id = ?", p.ID).Count(&msgCount)
+	if msgCount != 0 {
+		t.Fatalf("事件写入失败应整体回滚，Message 不应落库，实际 %d 条", msgCount)
+	}
+	var evtCount int64
+	store.DB.Model(&store.Event{}).Where("project_id = ?", p.ID).Count(&evtCount)
+	if evtCount != 0 {
+		t.Fatalf("事务回滚后不应有任何事件残留，实际 %d 条", evtCount)
+	}
+}
+
+// TestCommitFailureSuccess CommitFailure 正常路径：状态、事件、消息三者应同事务原子落库，
+// keepHTML 时 HTML 回退到 LastGoodHTML。
+func TestCommitFailureSuccess(t *testing.T) {
+	openTestDB(t)
+	uid := newTestUser(t)
+	p := &store.Project{UserID: uid, Name: "项目", Brief: "b", Template: "todo",
+		HTML: brokenHTML, LastGoodHTML: validHTML, Status: "generating", Version: 1,
+		CreatedAtMs: store.Now(), UpdatedAtMs: store.Now()}
+	if err := store.DB.Create(p).Error; err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if err := store.CommitFailure(p.ID, "failed", "构建失败: 校验未通过", "err", true, "改一下", uid); err != nil {
+		t.Fatalf("CommitFailure 应成功: %v", err)
+	}
+	var reloaded store.Project
+	store.DB.Where("id = ?", p.ID).First(&reloaded)
+	if reloaded.Status != "failed" {
+		t.Fatalf("状态应为 failed，实际 %s", reloaded.Status)
+	}
+	if reloaded.HTML != validHTML {
+		t.Fatal("keepHTML=true 时 HTML 应回退到 LastGoodHTML")
+	}
+	var evt store.Event
+	if err := store.DB.Where("project_id = ? AND stage = ?", p.ID, "done").First(&evt).Error; err != nil {
+		t.Fatalf("应有一条 done 事件: %v", err)
+	}
+	var msg store.Message
+	if err := store.DB.Where("project_id = ? AND status = ?", p.ID, "failed").First(&msg).Error; err != nil {
+		t.Fatalf("应有一条 failed 消息: %v", err)
+	}
+	if msg.Text != "改一下" {
+		t.Fatalf("消息文本应为传入的 brief，实际 %q", msg.Text)
+	}
+}
+

@@ -116,7 +116,7 @@ func (h *Handlers) guestLogin(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建游客失败"})
 		return
 	}
-	token, _ := auth.IssueToken(h.Cfg.JWTSecret, u.ID, u.Email)
+	token, _ := auth.IssueTokenV(h.Cfg.JWTSecret, u.ID, u.Email, u.TokenVersion)
 	c.JSON(http.StatusOK, gin.H{
 		"token": token,
 		"user":  gin.H{"id": u.ID, "email": u.Email, "guest": true},
@@ -386,7 +386,7 @@ func (h *Handlers) register(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建用户失败"})
 		return
 	}
-	token, _ := auth.IssueToken(h.Cfg.JWTSecret, u.ID, u.Email)
+	token, _ := auth.IssueTokenV(h.Cfg.JWTSecret, u.ID, u.Email, u.TokenVersion)
 	c.JSON(http.StatusOK, gin.H{"token": token, "user": gin.H{"id": u.ID, "email": u.Email}})
 }
 
@@ -407,7 +407,7 @@ func (h *Handlers) login(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "邮箱或密码错误"})
 		return
 	}
-	token, _ := auth.IssueToken(h.Cfg.JWTSecret, u.ID, u.Email)
+	token, _ := auth.IssueTokenV(h.Cfg.JWTSecret, u.ID, u.Email, u.TokenVersion)
 	c.JSON(http.StatusOK, gin.H{"token": token, "user": gin.H{"id": u.ID, "email": u.Email}})
 }
 
@@ -753,9 +753,13 @@ func (h *Handlers) issueTicket(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ticket": sseTicket, "ttl": 60})
 }
 
-// logout 清除预览 Cookie：退出登录时立即失效 HttpOnly 凭据。
-// 公用电脑场景下，退出后 1 小时内他人不可再用旧 Cookie 直开预览/下载地址。
+// logout 退出登录：TokenVersion+1 立即吊销本用户之前签发的全部 JWT（包括当前这个），
+// 并清除预览 Cookie。公用电脑场景下，退出后旧 token/Cookie 立即失效，无需等待自然过期。
 func (h *Handlers) logout(c *gin.Context) {
+	if _, err := store.RevokeUserTokens(middleware.UID(c)); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "退出失败，请重试"})
+		return
+	}
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     "atomix_preview",
 		Value:    "",
@@ -831,6 +835,11 @@ func ticketOrBearer(jwtSecret, ticketSecret string) gin.HandlerFunc {
 		}
 		if claims.Use == "ticket" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "ticket 不可作为 Bearer 使用"})
+			return
+		}
+		// 版本号比对：退出登录后旧 token 立即失效（与 UserIdentity 中间件一致）
+		if store.IsTokenRevoked(claims.UserID, claims.TV) {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "登录已失效，请重新登录"})
 			return
 		}
 		c.Set("uid", claims.UserID)

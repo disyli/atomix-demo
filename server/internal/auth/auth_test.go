@@ -30,6 +30,28 @@ func TestIssueToken_Valid(t *testing.T) {
 	}
 }
 
+// TestIssueTokenV_CarriesTokenVersion 验证 IssueTokenV 正确写入 tv 字段：
+// 退出登录的吊销机制依赖此字段与库内 User.TokenVersion 比对。
+func TestIssueTokenV_CarriesTokenVersion(t *testing.T) {
+	tok, err := auth.IssueTokenV(jwtSecret, 42, "a@b.com", 3)
+	if err != nil {
+		t.Fatalf("IssueTokenV error: %v", err)
+	}
+	claims, err := auth.ParseToken(jwtSecret, tok)
+	if err != nil {
+		t.Fatalf("ParseToken error: %v", err)
+	}
+	if claims.TV != 3 {
+		t.Errorf("TV want 3 got %d", claims.TV)
+	}
+	// IssueToken（无版本号的旧调用点）应等价于 tv=0，保持向后兼容
+	tok0, _ := auth.IssueToken(jwtSecret, 42, "a@b.com")
+	claims0, _ := auth.ParseToken(jwtSecret, tok0)
+	if claims0.TV != 0 {
+		t.Errorf("IssueToken 应默认 tv=0，实际 %d", claims0.TV)
+	}
+}
+
 // TestIssueTicket_HasUseField 验证票据携带 use=ticket 且用 ticketSecret 签名
 func TestIssueTicket_HasUseField(t *testing.T) {
 	ticket, err := auth.IssueTicket(ticketSecret, 7, "x@y.com")

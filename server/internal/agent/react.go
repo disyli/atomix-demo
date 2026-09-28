@@ -665,9 +665,9 @@ func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, exis
 
 	// 用户主动停止：状态 stopped（区别于失败），保留最后成功版本，事件留痕
 	if errors.Is(loopErr, ErrCanceled) {
-		store.MarkProjectStatus(project.ID, "stopped", true)
-		rt.appendEvent(project.ID, "done", "用户已停止本次构建", "warn")
-		AppendRunMessage(project.ID, brief, userID, "stopped")
+		if err := store.CommitFailure(project.ID, "stopped", "用户已停止本次构建", "warn", true, brief, userID); err != nil {
+			rt.appendEvent(project.ID, "done", "停止终态落库失败: "+err.Error(), "err")
+		}
 		return nil, loopErr
 	}
 
@@ -698,9 +698,10 @@ func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, exis
 		doneMsg := fmt.Sprintf("产物已通过校验并落库为 v%%d：%s", label)
 		snap, snapErr := store.CommitSuccess(project.ID, rt.html, label, doneMsg, rt.summary, brief, userID)
 		if snapErr != nil {
-			store.MarkProjectStatus(project.ID, "failed", true)
-			rt.appendEvent(project.ID, "done", "终态事务提交失败（源码/快照/事件/消息已整体回滚）: "+snapErr.Error(), "err")
-			AppendRunMessage(project.ID, brief, userID, "failed")
+			failMsg := "终态事务提交失败（源码/快照/事件/消息已整体回滚）: " + snapErr.Error()
+			if err := store.CommitFailure(project.ID, "failed", failMsg, "err", true, brief, userID); err != nil {
+				rt.appendEvent(project.ID, "done", "失败终态落库也失败: "+err.Error(), "err")
+			}
 			return nil, snapErr
 		}
 		// 重载最新项目行（提交事务已更新 version/html 等）
@@ -726,12 +727,12 @@ func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, exis
 	case !rt.checksPassed:
 		reason = "构建失败：产物未通过校验（存在未修复的 issues），已保留最后成功版本"
 	}
-	store.MarkProjectStatus(project.ID, "failed", true)
-	rt.appendEvent(project.ID, "done", reason, "err")
+	if err := store.CommitFailure(project.ID, "failed", reason, "err", true, brief, userID); err != nil {
+		rt.appendEvent(project.ID, "done", "失败终态落库失败: "+err.Error(), "err")
+	}
 	if loopErr == nil {
 		loopErr = fmt.Errorf("%s", reason)
 	}
-	AppendRunMessage(project.ID, brief, userID, "failed")
 	return nil, loopErr
 }
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"atomix-demo/server/internal/auth"
+	"atomix-demo/server/internal/store"
 	"github.com/gin-gonic/gin"
 )
 
@@ -12,6 +13,8 @@ import (
 // 短期票据（ticket= query 参数）仅被 ticketOrBearer 中间件接受，
 // 用于 preview/source/generate 等 URL 传参场景；其他接口拒绝 ticket，
 // 防止票据被用于写操作（创建项目、迭代等）。
+// checkTV 用于校验 claims.tv 是否与库内当前 TokenVersion 一致：退出登录后旧 token
+// 立即被拒绝（401），不必等待 7 天自然过期。
 func UserIdentity(jwtSecret, _ string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 短期票据严禁在写接口组使用：返回 401 而不是静默降级
@@ -33,6 +36,11 @@ func UserIdentity(jwtSecret, _ string) gin.HandlerFunc {
 		// 拒绝票据伪造成普通 token 的情形（Use != "" && Use != "token"）
 		if claims.Use == "ticket" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "ticket 不可用于此接口"})
+			return
+		}
+		// 版本号比对：退出登录会使库内 TokenVersion+1，旧 token 的 tv 落后即判定已吊销
+		if store.IsTokenRevoked(claims.UserID, claims.TV) {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "登录已失效，请重新登录"})
 			return
 		}
 		c.Set("uid", claims.UserID)
