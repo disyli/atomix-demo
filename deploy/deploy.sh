@@ -56,6 +56,12 @@ docker run -d --name $CONTAINER \
   --restart unless-stopped \
   atomix-demo:latest
 
+# ---------- 数据目录权限收敛：库内含密码哈希与业务数据 ----------
+# 目录 700（其他用户不可进入）、数据库 600（其他用户不可读）；
+# 容器以 root 运行，收紧宿主侧权限不影响容器读写。
+chmod 700 "$DATA_DIR"
+chmod 600 "$DATA_DIR/atomix.db" 2>/dev/null || true
+
 # ---------- 健康自检（核对 SHA 与运行状态） ----------
 sleep 2
 HEALTH=$(curl -s http://127.0.0.1:8080/api/health || true)
@@ -126,6 +132,15 @@ server {
 NGINX
 mkdir -p /var/www/acme
 sed -i "s|__CERT__|$CERT|; s|__KEY__|$KEY|" /etc/nginx/conf.d/atomix.conf
+
+# ---------- 数据库每日备份：注册 cron（幂等，重复执行不重复注册） ----------
+cp -f deploy/backup-db.sh /usr/local/bin/atomix-backup-db.sh
+chmod 700 /usr/local/bin/atomix-backup-db.sh
+cat > /etc/cron.d/atomix-backup <<'CRON'
+# Atomix Demo 数据库每日备份（由 deploy.sh 维护，勿手改）
+30 4 * * * root /usr/local/bin/atomix-backup-db.sh >> /var/log/atomix-backup.log 2>&1
+CRON
+chmod 644 /etc/cron.d/atomix-backup
 
 # 释放 80 端口：容器已不再直接占用；同时禁用 Ubuntu 默认站点（抢占 80 导致跳转失效）
 rm -f /etc/nginx/sites-enabled/default

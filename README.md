@@ -55,6 +55,8 @@ cd server && go run .
 | `DEEPSEEK_API_KEY` | 空 | 留空则进入演示模式 |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API 地址 |
 | `DEEPSEEK_MODEL` | `deepseek-chat` | 模型名 |
+| `ATOMIX_GUEST_ENABLED` | `1` | 游客一键登录开关（`0` 关闭） |
+| `ATOMIX_GUEST_TTL_HOURS` | `24` | 游客账号过期时长（小时），过期后连同数据级联删除；`0` 关闭清理 |
 
 ## 技术栈
 

@@ -364,6 +364,12 @@ func (h *Handlers) register(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "密码不能超过 128 位"})
 		return
 	}
+	// @guest.atomix 是游客账号保留命名空间：后台清理任务按此后缀级联删除过期游客，
+	// 正式注册若占用该域会被清理逻辑误删，必须拒绝。
+	if strings.HasSuffix(req.Email, "@guest.atomix") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "该邮箱域名被系统保留，请更换邮箱"})
+		return
+	}
 	var cnt int64
 	store.DB.Model(&store.User{}).Where("email = ?", req.Email).Count(&cnt)
 	if cnt > 0 {

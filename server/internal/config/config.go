@@ -22,6 +22,9 @@ type Config struct {
 	DeploySHA string
 	// GuestEnabled 游客入口开关（默认开启；评审无需注册个人账号即可体验）
 	GuestEnabled bool
+	// GuestTTLHours 游客账号过期时长（小时）：过期游客连同项目/事件/消息/附件/快照
+	// 由后台任务级联删除；0 = 关闭清理（游客数据永不过期）
+	GuestTTLHours int
 }
 
 // BuiltinDeploySHA 构建期经 -ldflags 注入的部署标识（Dockerfile 传入 git short SHA）。
@@ -39,7 +42,8 @@ func Load() (*Config, error) {
 	dir = filepath.Dir(dir)
 
 	dataDir := getEnv("ATOMIX_DATA_DIR", filepath.Join(dir, "data"))
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	// 700：数据目录含数据库（密码哈希/业务数据），禁止同机其他用户进入
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
@@ -53,6 +57,7 @@ func Load() (*Config, error) {
 		// 部署标识：优先运行时环境变量（deploy.sh 注入），否则用构建期 ldflags 值
 		DeploySHA:    getEnv("ATOMIX_DEPLOY_SHA", firstNonEmpty(BuiltinDeploySHA, "dev-local")),
 		GuestEnabled: getEnv("ATOMIX_GUEST_ENABLED", "1") == "1",
+		GuestTTLHours: getEnvInt("ATOMIX_GUEST_TTL_HOURS", 24),
 	}
 	// 票据密钥：优先环境变量，未配置时从 JWTSecret 派生（+_ticket 后缀），保持零配置可用
 	cfg.TicketSecret = getEnv("ATOMIX_TICKET_SECRET", cfg.JWTSecret+"_ticket")

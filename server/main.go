@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"atomix-demo/server/internal/agent"
 	"atomix-demo/server/internal/api"
@@ -26,6 +27,27 @@ func main() {
 	}
 	if err := store.Open(cfg.DataDir); err != nil {
 		log.Fatalf("open store: %v", err)
+	}
+
+	// 游客账号过期清理：游客是一次性评审账号，默认 24h 过期（ATOMIX_GUEST_TTL_HOURS，0=关闭），
+	// 过期后连同项目/事件/消息/附件/快照级联删除；生成中的游客项目自动跳过。
+	// 启动即执行一次，此后每小时巡检。
+	if cfg.GuestTTLHours > 0 {
+		go func() {
+			run := func() {
+				n, err := store.CleanupGuests(cfg.GuestTTLHours)
+				switch {
+				case err != nil:
+					log.Printf("guest cleanup: %v", err)
+				case n > 0:
+					log.Printf("guest cleanup: 已清理 %d 个过期游客账号（TTL=%dh）", n, cfg.GuestTTLHours)
+				}
+			}
+			run()
+			for range time.Tick(time.Hour) {
+				run()
+			}
+		}()
 	}
 
 	gin.SetMode(gin.ReleaseMode)

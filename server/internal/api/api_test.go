@@ -396,3 +396,21 @@ func TestProjectLock_MutexSemantics(t *testing.T) {
 		t.Error("释放后 TryLockProject 应返回 true")
 	}
 }
+
+// ---------- 游客保留域：register 必须拒绝 @guest.atomix ----------
+
+// TestRegister_RejectsGuestDomain
+// 后台清理按 @guest.atomix 后缀级联删除过期游客；若正式注册可占用该域，
+// 注册用户的账号会被清理任务误删。修复后 register 直接拒绝保留域。
+func TestRegister_RejectsGuestDomain(t *testing.T) {
+	r, _, _ := newTestApp(t)
+	w := doJSON(r, "POST", "/api/auth/register", "", `{"email":"realuser@guest.atomix","password":"123456"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("注册 @guest.atomix 保留域应被拒绝(400)，实际 %d: %s", w.Code, w.Body.String())
+	}
+	// 正常域名不受影响
+	w2 := doJSON(r, "POST", "/api/auth/register", "", `{"email":"realuser@example.com","password":"123456"}`)
+	if w2.Code != http.StatusOK {
+		t.Errorf("正常邮箱注册应成功(200)，实际 %d: %s", w2.Code, w2.Body.String())
+	}
+}

@@ -431,3 +431,87 @@ func TestMultiUser_FullIsolation(t *testing.T) {
 		t.Error("B 的快照引用了 A 的项目（快照跨用户污染）")
 	}
 }
+
+// ---------- 游客过期清理（TTL + 级联删除） ----------
+
+// TestCleanupGuests_TTLAndCascade
+// 游客账号应按 TTL 过期：过期游客连同项目/事件/消息/附件/快照级联删除，
+// 正式账号与未过期游客不受影响，generating 状态项目的所属游客跳过。
+func TestCleanupGuests_TTLAndCascade(t *testing.T) {
+	newSecDB(t)
+	oldMs := store.Now() - 48*3600*1000 // 48h 前：超过默认 24h TTL
+	freshMs := store.Now() - 3600 * 1000 // 1h 前：未过期
+
+	mkGuest := func(email string, createdMs int64) *store.User {
+		u := &store.User{Email: email, PasswordHash: "x", CreatedAtMs: createdMs, UpdatedAtMs: createdMs}
+		store.DB.Create(u)
+		return u
+	}
+
+	expiredGuest := mkGuest("guest_old@guest.atomix", oldMs)
+	freshGuest := mkGuest("guest_new@guest.atomix", freshMs)
+	realUser := createUser(t, "real@example.com")
+
+	// 过期游客的数据：项目 + 事件 + 消息 + 附件 + 快照
+	p := &store.Project{UserID: expiredGuest.ID, Name: "游客项目", Status: "ready", CreatedAtMs: oldMs, UpdatedAtMs: oldMs}
+	store.DB.Create(p)
+	store.DB.Create(&store.Event{ProjectID: p.ID, Stage: "plan", Message: "m", TsMs: oldMs})
+	store.DB.Create(&store.Message{ProjectID: p.ID, UserID: expiredGuest.ID, Role: "user", Kind: "text", Text: "hi", CreatedAtMs: oldMs})
+	store.DB.Create(&store.Attachment{UserID: expiredGuest.ID, Name: "f.txt", Content: "c", CreatedAtMs: oldMs})
+	store.DB.Create(&store.Snapshot{ProjectID: p.ID, Version: 1, HTML: "<html></html>", Status: "done", CreatedAtMs: oldMs})
+
+	// generating 游客：正在构建，即使过期也跳过
+	busyGuest := mkGuest("guest_busy@guest.atomix", oldMs)
+	store.DB.Create(&store.Project{UserID: busyGuest.ID, Name: "生成中", Status: "generating", CreatedAtMs: oldMs, UpdatedAtMs: oldMs})
+
+	n, err := store.CleanupGuests(24)
+	if err != nil {
+		t.Fatalf("CleanupGuests: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("应清理 1 个过期游客（generating 游客跳过），实际 %d", n)
+	}
+	// 过期游客及其数据全部消失
+	for name, cnt := range map[string]int64{
+		"users":       0, "projects": 0, "events": 0,
+		"messages":    0, "attachments": 0, "snapshots": 0,
+	} {
+		var c int64
+		switch name {
+		case "users":
+			store.DB.Model(&store.User{}).Where("id = ?", expiredGuest.ID).Count(&c)
+		case "projects":
+			store.DB.Model(&store.Project{}).Where("user_id = ?", expiredGuest.ID).Count(&c)
+		case "events":
+			store.DB.Model(&store.Event{}).Where("project_id = ?", p.ID).Count(&c)
+		case "messages":
+			store.DB.Model(&store.Message{}).Where("user_id = ?", expiredGuest.ID).Count(&c)
+		case "attachments":
+			store.DB.Model(&store.Attachment{}).Where("user_id = ?", expiredGuest.ID).Count(&c)
+		case "snapshots":
+			store.DB.Model(&store.Snapshot{}).Where("project_id = ?", p.ID).Count(&c)
+		}
+		if c != int64(cnt) {
+			t.Errorf("过期游客 %s 应为 0，实际 %d", name, c)
+		}
+	}
+	// 未过期游客、generating 游客、正式账号均保留
+	for _, u := range []*store.User{freshGuest, busyGuest, realUser} {
+		var c int64
+		store.DB.Model(&store.User{}).Where("id = ?", u.ID).Count(&c)
+		if c != 1 {
+			t.Errorf("用户 %s 不应被删除", u.Email)
+		}
+	}
+	// TTL=0 关闭清理：什么都删不了
+	u2 := mkGuest("guest_off@guest.atomix", oldMs)
+	n2, _ := store.CleanupGuests(0)
+	if n2 != 0 {
+		t.Errorf("TTL=0 应关闭清理，实际删了 %d 个", n2)
+	}
+	var keep int64
+	store.DB.Model(&store.User{}).Where("id = ?", u2.ID).Count(&keep)
+	if keep != 1 {
+		t.Error("TTL=0 时过期游客不应被删除")
+	}
+}

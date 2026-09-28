@@ -180,3 +180,59 @@ func ListSnapshots(projectID uint) ([]Snapshot, error) {
 
 // DB 持有全局 gorm 实例。
 var DB *gorm.DB
+
+// CleanupGuests 清理过期游客账号及其全部数据（级联删除）。
+// 游客邮箱统一 @guest.atomix 后缀，创建时间早于 cutoff 的游客连同其
+// 项目/事件/消息/附件/快照一并删除；仍处 generating 状态的项目所在游客跳过
+// （避免删到正在运行的构建）。返回删除的游客数；ttlHours<=0 时直接返回（清理关闭）。
+// 正式注册账号不匹配该后缀（register 拒绝保留域），永不受影响。
+func CleanupGuests(ttlHours int) (int64, error) {
+	if ttlHours <= 0 {
+		return 0, nil
+	}
+	cutoff := Now() - int64(ttlHours)*3600*1000
+	var removed int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var guestIDs []uint
+		if err := tx.Model(&User{}).
+			Where("email LIKE ? AND created_at_ms < ?"+
+				" AND id NOT IN (SELECT user_id FROM projects WHERE status = 'generating')",
+				"%@guest.atomix", cutoff).
+			Pluck("id", &guestIDs).Error; err != nil {
+			return err
+		}
+		if len(guestIDs) == 0 {
+			return nil
+		}
+		var projectIDs []uint
+		if err := tx.Model(&Project{}).Where("user_id IN ?", guestIDs).Pluck("id", &projectIDs).Error; err != nil {
+			return err
+		}
+		if len(projectIDs) > 0 {
+			if err := tx.Where("project_id IN ?", projectIDs).Delete(&Event{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("project_id IN ?", projectIDs).Delete(&Snapshot{}).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Where("user_id IN ?", guestIDs).Delete(&Message{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id IN ?", guestIDs).Delete(&Attachment{}).Error; err != nil {
+			return err
+		}
+		if len(projectIDs) > 0 {
+			if err := tx.Where("id IN ?", projectIDs).Delete(&Project{}).Error; err != nil {
+				return err
+			}
+		}
+		res := tx.Where("id IN ?", guestIDs).Delete(&User{})
+		if res.Error != nil {
+			return res.Error
+		}
+		removed = res.RowsAffected
+		return nil
+	})
+	return removed, err
+}
