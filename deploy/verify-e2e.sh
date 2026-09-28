@@ -79,6 +79,15 @@ run_sse() {
 # 从 SSE 输出解析项目 ID（done 事件的 JSON 里第一个 "id":N）
 sse_pid() { grep -o '"id":[0-9]*' "$1" | head -1 | grep -o '[0-9]*'; }
 
+# pv_cookie <token> <jar>: 签发预览 Cookie（HttpOnly，1h）到 cookie jar。
+# /api/projects/:id/source 与 /preview 走 Cookie 鉴权（设计上不收 Bearer、
+# 凭据不进 URL/日志），脚本用 cookie jar 与浏览器行为保持一致。
+pv_cookie() {
+  local tok=$1 jar=$2
+  rm -f "$jar"
+  curl -sk -X POST "$BASE/api/ticket" -H "Authorization: Bearer $tok" -c "$jar" > /dev/null
+}
+
 section "0. 部署标识与 HTTPS"
 HEALTH=$($CURL "$BASE/api/health")
 MODE=$(json_get "$HEALTH" mode)
@@ -109,39 +118,45 @@ TS=$($CURL -X POST "$BASE/api/auth/guest"); TSnk=$(json_get "$TS" token)
 # 2.1 计算器
 say "构建计算器…"
 ENC1=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "做一个极简计算器，支持四则运算")
-run_sse /tmp/e2e-cal.txt "$TCal" "$BASE/api/generate?brief=$ENC1&mode=build&t=$TCal"
+pv_cookie "$TCal" /tmp/e2e-cal.jar
+run_sse /tmp/e2e-cal.txt "$TCal" -H "Authorization: Bearer $TCal" "$BASE/api/generate?brief=$ENC1&mode=build"
 CAL_ID=$(sse_pid /tmp/e2e-cal.txt)
 if [ -n "$CAL_ID" ] && [ "$CAL_ID" != "0" ]; then ok "计算器项目已创建 (id=$CAL_ID)"; else bad "计算器构建失败: $(tail -c 300 /tmp/e2e-cal.txt)"; fi
 
 # 2.2 贪吃蛇
 say "构建贪吃蛇…"
 ENC2=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "做一个贪吃蛇小游戏")
-run_sse /tmp/e2e-snake.txt "$TSnk" "$BASE/api/generate?brief=$ENC2&mode=build&t=$TSnk"
+pv_cookie "$TSnk" /tmp/e2e-snk.jar
+run_sse /tmp/e2e-snake.txt "$TSnk" -H "Authorization: Bearer $TSnk" "$BASE/api/generate?brief=$ENC2&mode=build"
 SNK_ID=$(sse_pid /tmp/e2e-snake.txt)
 if [ -n "$SNK_ID" ] && [ "$SNK_ID" != "0" ]; then ok "贪吃蛇项目已创建 (id=$SNK_ID)"; else bad "贪吃蛇构建失败: $(tail -c 300 /tmp/e2e-snake.txt)"; fi
 
 if [ -n "$CAL_ID" ] && [ -n "$SNK_ID" ]; then
-  SRC1=$($CURL -H "Authorization: Bearer $TCal" "$BASE/api/projects/$CAL_ID/source")
-  SRC2=$($CURL -H "Authorization: Bearer $TSnk" "$BASE/api/projects/$SNK_ID/source")
+  SRC1=$($CURL -b /tmp/e2e-cal.jar "$BASE/api/projects/$CAL_ID/source")
+  SRC2=$($CURL -b /tmp/e2e-snk.jar "$BASE/api/projects/$SNK_ID/source")
   S1=$(json_str "$SRC1" source); S2=$(json_str "$SRC2" source)
-  if echo "$S1" | grep -qi "calc\|计算"; then ok "计算器源码含计算器特征"; else bad "计算器源码无特征"; fi
-  if echo "$S2" | grep -qi "snake\|贪吃蛇\|canvas"; then ok "贪吃蛇源码含游戏特征"; else bad "贪吃蛇源码无特征"; fi
+  if echo "$S1" | grep -qi "calc\|计算"; then ok "计算器源码含计算器特征"; else bad "计算器源码无特征: $(head -c 120 <<<"$SRC1")"; fi
+  if echo "$S2" | grep -qi "snake\|贪吃蛇\|canvas"; then ok "贪吃蛇源码含游戏特征"; else bad "贪吃蛇源码无特征: $(head -c 120 <<<"$SRC2")"; fi
   if [ "$S1" != "$S2" ] && [ -n "$S1" ] && [ -n "$S2" ]; then ok "两类 Prompt 源码不同（独立产物）"; else bad "两类 Prompt 源码相同（串模板）"; fi
-  # 预览接口同样返回各自内容
-  PV1=$($CURL -H "Authorization: Bearer $TCal" "$BASE/api/projects/$CAL_ID/preview")
-  PV2=$($CURL -H "Authorization: Bearer $TSnk" "$BASE/api/projects/$SNK_ID/preview")
+  # 预览接口同样返回各自内容（Cookie 鉴权，与浏览器 iframe 行为一致）
+  PV1=$($CURL -b /tmp/e2e-cal.jar "$BASE/api/projects/$CAL_ID/preview")
+  PV2=$($CURL -b /tmp/e2e-snk.jar "$BASE/api/projects/$SNK_ID/preview")
   if [ "$PV1" != "$PV2" ]; then ok "两类 Preview 内容不同"; else bad "两类 Preview 相同"; fi
+  # 越权防护：游客 B 的 Cookie 不应访问游客 A 的预览（401/404 都属拒绝）
+  XA=$($CURL -o /dev/null -w '%{http_code}' -b /tmp/e2e-snk.jar "$BASE/api/projects/$CAL_ID/preview")
+  if [ "$XA" = "401" ] || [ "$XA" = "404" ]; then ok "预览跨账号拒绝（$XA，Cookie 鉴权带身份）"; else bad "预览跨账号未拒绝（$XA）"; fi
 fi
 
 section "3. 同一项目两轮成功增量"
 TA=$($CURL -X POST "$BASE/api/auth/guest"); TAcc=$(json_get "$TA" token)
 ENC3=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "做一个极简计算器，支持四则运算")
-run_sse /tmp/e2e-inc1.txt "$TAcc" "$BASE/api/generate?brief=$ENC3&mode=build&t=$TAcc"
+pv_cookie "$TAcc" /tmp/e2e-acc.jar
+run_sse /tmp/e2e-inc1.txt "$TAcc" -H "Authorization: Bearer $TAcc" "$BASE/api/generate?brief=$ENC3&mode=build"
 PID=$(sse_pid /tmp/e2e-inc1.txt)
 if [ -z "$PID" ] || [ "$PID" = "0" ]; then bad "增量基线项目构建失败: $(tail -c 300 /tmp/e2e-inc1.txt)"; else
   ok "基线项目就绪 (id=$PID)"
   # 第一轮产物
-  SRC_A=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/source")
+  SRC_A=$($CURL -b /tmp/e2e-acc.jar "$BASE/api/projects/$PID/source")
   EV1=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/events")
   if echo "$EV1" | grep -q "write_file"; then ok "第 1 轮含 write_file 记录"; else bad "第 1 轮无 write_file 记录"; fi
   if echo "$EV1" | grep -q "校验全部通过"; then ok "第 1 轮校验通过留痕"; else bad "第 1 轮校验未通过"; fi
@@ -155,15 +170,16 @@ if [ -z "$PID" ] || [ "$PID" = "0" ]; then bad "增量基线项目构建失败: 
   PROJ=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID")
   VER=$(json_get "$PROJ" version)
   if [ "$VER" -ge 2 ] 2>/dev/null; then ok "两轮后版本号 v$VER（递增）"; else bad "版本未递增: v$VER"; fi
-  SRC_B=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/source")
+  SRC_B=$($CURL -b /tmp/e2e-acc.jar "$BASE/api/projects/$PID/source")
   S_A=$(json_str "$SRC_A" source); S_B=$(json_str "$SRC_B" source)
   if [ "$S_A" != "$S_B" ] && [ -n "$S_B" ]; then ok "两轮源码存在差异（真实增量）"; else bad "两轮源码无差异"; fi
   EV2=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/events")
   if echo "$EV2" | grep -q "edit_file"; then ok "增量轮走 edit_file 精准修改"; else say "（demo 模式下增量可能整体重写，跳过 edit_file 断言）"; fi
   # 旧功能保留：第二轮源码仍含第一轮核心特征
   if echo "$S_B" | grep -qi "calc\|计算"; then ok "旧功能保留（计算器特征仍在）"; else bad "旧功能丢失"; fi
-  # 预览与源码一致（原子）
-  PV=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/preview")
+  # 预览与源码一致（原子）：Cookie 过期前重签（每轮构建耗时可能超 1h TTL）
+  pv_cookie "$TAcc" /tmp/e2e-acc.jar
+  PV=$($CURL -b /tmp/e2e-acc.jar "$BASE/api/projects/$PID/preview")
   if [ -n "$PV" ]; then ok "预览可访问且已更新"; else bad "预览异常"; fi
 fi
 
@@ -210,10 +226,11 @@ if [ -n "$PID" ]; then
   AS=$(json_get "$AFTER" status)
   # stopped/ready 都属合法终态：关键是不能永远 generating，且 version 不回退
   if [ "$AS" = "stopped" ] || [ "$AS" = "ready" ]; then ok "中断轮落到合法终态（$AS），version=$AV 未回退"; else bad "中断后状态异常: $AS v=$AV"; fi
-  SRC_KEEP=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/source")
+  pv_cookie "$TAcc" /tmp/e2e-acc.jar
+  SRC_KEEP=$($CURL -b /tmp/e2e-acc.jar "$BASE/api/projects/$PID/source")
   KEEP_S=$(json_str "$SRC_KEEP" source)
   if [ -n "$KEEP_S" ]; then ok "失败/中断后源码保留（最后成功版本）"; else bad "源码丢失"; fi
-  PV_KEEP=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/preview")
+  PV_KEEP=$($CURL -b /tmp/e2e-acc.jar "$BASE/api/projects/$PID/preview")
   if [ -n "$PV_KEEP" ]; then ok "失败/中断后预览仍可用"; else bad "预览丢失"; fi
 else
   say "（第 3 节基线项目未建成，跳过失败落库断言）"
@@ -225,14 +242,14 @@ if [ -n "$PID" ]; then
   CNT=$(echo "$SNAPS" | grep -o '"version":' | wc -l)
   if [ "$CNT" -ge 2 ]; then ok "快照列表 $CNT 条（每轮构建各一条）"; else bad "快照不足: $CNT 条"; fi
   # 记录回滚前的 v2 源码指纹，回滚到 v1 后源码必须变化且恢复计算器 v1 特征
-  SRC_V2=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/source")
+  SRC_V2=$($CURL -b /tmp/e2e-acc.jar "$BASE/api/projects/$PID/source")
   S_V2=$(json_str "$SRC_V2" source)
   RB_RESP=$($CURL -X POST "$BASE/api/projects/$PID/rollback" -H "Authorization: Bearer $TAcc" -H 'Content-Type: application/json' -d '{"version":1}')
   RB_VER=$(json_str "$RB_RESP" rollbackTo)
   if [ "$RB_VER" = "1" ]; then ok "回滚到 v1 接口受理（rollbackTo=$RB_VER）"; else bad "回滚响应异常: $(tail -c 200 <<<"$RB_RESP")"; fi
-  SRC_C=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/source")
+  SRC_C=$($CURL -b /tmp/e2e-acc.jar "$BASE/api/projects/$PID/source")
   SC=$(json_str "$SRC_C" source)
-  PV_C=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/preview")
+  PV_C=$($CURL -b /tmp/e2e-acc.jar "$BASE/api/projects/$PID/preview")
   if [ -n "$SC" ] && [ -n "$PV_C" ]; then
     ok "回滚后源码与预览均返回内容（原子切换）"
   else
@@ -265,6 +282,10 @@ if [ -n "$PID" ]; then
   TX=$($CURL -X POST "$BASE/api/auth/guest"); TIsol=$(json_get "$TX" token)
   CROSS=$(curl -sk -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TIsol" "$BASE/api/projects/$PID")
   if [ "$CROSS" = "404" ] || [ "$CROSS" = "403" ]; then ok "游客 B 无法访问游客 A 的项目（隔离生效，$CROSS）"; else bad "跨账号访问未隔离（$CROSS）"; fi
+  # 预览路由同样隔离：游客 B 签发自己的 Cookie 后访问 A 的预览必须被拒
+  pv_cookie "$TIsol" /tmp/e2e-isol.jar
+  CROSS_PV=$(curl -sk -o /dev/null -w '%{http_code}' -b /tmp/e2e-isol.jar "$BASE/api/projects/$PID/preview")
+  if [ "$CROSS_PV" = "401" ] || [ "$CROSS_PV" = "404" ]; then ok "预览路由跨账号拒绝（$CROSS_PV）"; else bad "预览路由跨账号未隔离（$CROSS_PV）"; fi
 else
   say "（第 3 节基线项目未建成，跳过账号隔离断言）"
 fi
