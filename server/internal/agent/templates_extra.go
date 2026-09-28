@@ -101,7 +101,7 @@ func calculatorHTML() string {
 </html>`
 }
 
-// snakeHTML 贪吃蛇小游戏：方向键/WASD 控制、计分、最高分持久化（localStorage）。
+// snakeHTML 贪吃蛇小游戏：方向键/WASD 控制、空格暂停/继续、三档难度切换、计分、最高分持久化（localStorage）。
 func snakeHTML() string {
 	return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -122,10 +122,14 @@ func snakeHTML() string {
   .overlay button { padding: 10px 26px; background: #2e9e5b; color: #fff; border: none; border-radius: 10px; font-size: 15px; cursor: pointer; }
   .overlay button:hover { background: #237a46; }
   .hidden { display: none; }
+  .diff { display: flex; gap: 8px; }
+  .dbtn { padding: 6px 18px; border: 1px solid #e3ded2; background: #fffdf8; color: #6b6455; border-radius: 10px; font-size: 13px; cursor: pointer; font-family: ui-monospace, monospace; transition: all .12s ease; }
+  .dbtn:hover { background: #f0ece0; }
+  .dbtn.on { background: #3d4fc4; color: #fff; border-color: #3d4fc4; }
 </style>
 </head>
 <body>
-<div class="hud">得分 <b id="score">0</b> · 最高 <b id="best">0</b></div>
+<div class="hud">得分 <b id="score">0</b> · 最高 <b id="best">0</b> · <span id="diffLabel">难度：普通</span></div>
 <div class="wrap">
   <canvas id="cv" width="400" height="400"></canvas>
   <div class="overlay" id="ov">
@@ -134,12 +138,17 @@ func snakeHTML() string {
     <button id="btn">开始游戏</button>
   </div>
 </div>
-<p class="tip">方向键 / WASD 控制 · 吃食物得分 · 撞墙或自己结束</p>
+<div class="diff">
+  <button class="dbtn" data-speed="170">慢速</button>
+  <button class="dbtn on" data-speed="130">普通</button>
+  <button class="dbtn" data-speed="90">快速</button>
+</div>
+<p class="tip">方向键 / WASD 控制 · 空格暂停/继续 · 吃食物得分 · 撞墙或自己结束</p>
 <script>
 (function () {
   var cv = document.getElementById('cv'), ctx = cv.getContext('2d');
   var N = 20, S = cv.width / N;
-  var snake, dir, food, score, best, timer, running = false;
+  var snake, dir, food, score, best, timer, running = false, paused = false, speed = 130;
   try { best = parseInt(localStorage.getItem('snake_best') || '0', 10) || 0; } catch (e) { best = 0; }
   document.getElementById('best').textContent = best;
   function spawnFood() {
@@ -181,6 +190,7 @@ func snakeHTML() string {
     if (head.x < 0 || head.x >= N || head.y < 0 || head.y >= N ||
         snake.some(function (s) { return s.x === head.x && s.y === head.y; })) {
       running = false;
+      paused = false;
       clearInterval(timer);
       if (score > best) {
         best = score;
@@ -204,14 +214,46 @@ func snakeHTML() string {
     draw();
   }
   function start() {
+    if (paused) {
+      // 空格暂停后继续：恢复原局，不重置
+      paused = false;
+      document.getElementById('ov').classList.add('hidden');
+      timer = setInterval(step, speed);
+      return;
+    }
     reset();
     running = true;
     document.getElementById('ov').classList.add('hidden');
-    timer = setInterval(step, 130);
+    timer = setInterval(step, speed);
+  }
+  function pause() {
+    if (!running || paused) return;
+    paused = true;
+    clearInterval(timer);
+    document.getElementById('ovTitle').textContent = '已暂停';
+    document.getElementById('ovText').textContent = '按空格或按钮继续';
+    document.getElementById('btn').textContent = '继续游戏';
+    document.getElementById('ov').classList.remove('hidden');
   }
   document.getElementById('btn').addEventListener('click', start);
+  // 难度切换：三档速度实时生效（进行中下一tick生效，未开始时下一局生效）
+  var diffNames = { 170: '慢速', 130: '普通', 90: '快速' };
+  document.querySelectorAll('.dbtn').forEach(function (b) {
+    b.addEventListener('click', function () {
+      document.querySelectorAll('.dbtn').forEach(function (x) { x.classList.remove('on'); });
+      b.classList.add('on');
+      speed = parseInt(b.getAttribute('data-speed'), 10);
+      document.getElementById('diffLabel').textContent = '难度：' + (diffNames[speed] || '普通');
+      if (running && !paused) { clearInterval(timer); timer = setInterval(step, speed); }
+    });
+  });
   document.addEventListener('keydown', function (e) {
     var k = e.key.toLowerCase();
+    if (k === ' ' || k === 'spacebar') {
+      e.preventDefault();
+      if (paused) { start(); } else { pause(); }
+      return;
+    }
     var nd = null;
     if (k === 'arrowup' || k === 'w') nd = { x: 0, y: -1 };
     else if (k === 'arrowdown' || k === 's') nd = { x: 0, y: 1 };
@@ -219,7 +261,7 @@ func snakeHTML() string {
     else if (k === 'arrowright' || k === 'd') nd = { x: 1, y: 0 };
     if (nd) {
       e.preventDefault();
-      if (!running) { dir = nd; start(); return; }
+      if (!running) { if (!paused) { dir = nd; start(); } return; }
       // 禁止 180 度回头
       if (nd.x !== -dir.x || nd.y !== -dir.y) dir = nd;
     }
@@ -265,12 +307,13 @@ func extraTplInfos() []TplInfo {
 			Reason: "需求是经典的贪吃蛇玩法，游戏模板最贴合",
 			Assets: []string{"20×20 网格画布 + HUD 计分条"},
 			Build:  []string{"蛇身数组模型与方向控制", "localStorage 最高分持久化"},
-			Scripts: []string{
-				"方向键/WASD 控制（禁止回头）",
-				"食物随机生成与得分",
-				"碰撞检测与结算浮层",
-			},
-			Features:    []string{"方向控制", "得分与最高分", "结算重开"},
+		Scripts: []string{
+			"方向键/WASD 控制（禁止回头）",
+			"食物随机生成与得分",
+			"碰撞检测与结算浮层",
+			"空格暂停/继续 + 三档难度速度切换",
+		},
+		Features:    []string{"方向控制", "得分与最高分", "暂停与难度切换", "结算重开"},
 			Highlighter: []string{"Canvas 网格渲染", "最高分持久化"},
 		},
 	}

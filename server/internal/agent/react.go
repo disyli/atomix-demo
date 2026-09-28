@@ -676,7 +676,7 @@ func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, exis
 	// checksPassed 由 run_checks 工具成功执行且无 issue 时置位（tools.go）
 	hasProduct := rt.html != ""
 	if loopErr == nil && hasProduct && rt.checksPassed {
-		// 全链路成功：模板/名称回填 → 快照事务（version+1 / HTML / LastGoodHTML / status=ready）
+		// 事务外独立回填展示字段（name/template）：不参与完成语义，失败不阻断
 		if rt.existing == nil {
 			if rt.plan.Template != "" {
 				project.Template = rt.plan.Template
@@ -692,27 +692,28 @@ func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, exis
 		if rt.existing != nil {
 			label = "迭代：" + truncateText(brief, 60)
 		}
-		snap, snapErr := store.CreateSnapshot(project.ID, rt.html, label)
+		// 单一事务原子提交：源码落库 + 快照 + 完成事件 + run 消息(status=done)，
+		// 四者全部成功项目才置 ready（"完成"）。任一步失败整体回滚，走失败路径
+		// 落库（保留最后成功版本），杜绝"显示完成但事件/消息缺失"的中间态。
+		// doneMsg 携带 %d 版本占位符，由事务内以实际 nextVer 格式化落库。
+		doneMsg := fmt.Sprintf("产物已通过校验并落库为 v%%d：%s", label)
+		snap, snapErr := store.CommitSuccess(project.ID, rt.html, label, doneMsg, rt.summary, brief, userID)
 		if snapErr != nil {
 			store.MarkProjectStatus(project.ID, "failed", true)
-			rt.appendEvent(project.ID, "done", "版本落库失败: "+snapErr.Error(), "err")
+			rt.appendEvent(project.ID, "done", "终态事务提交失败（源码/快照/事件/消息已整体回滚）: "+snapErr.Error(), "err")
 			AppendRunMessage(project.ID, brief, userID, "failed")
 			return nil, snapErr
 		}
-		// 重载最新项目行（快照事务已更新 version/html 等）
+		// 重载最新项目行（提交事务已更新 version/html 等）
 		if err := store.DB.Where("id = ?", project.ID).First(project).Error; err != nil {
 			return nil, err
 		}
-		rt.appendEvent(project.ID, "done", fmt.Sprintf("产物已通过校验并落库为 v%d：%s", snap.Version, label), "info")
-		if rt.summary != "" {
-			rt.appendEvent(project.ID, "done", rt.summary, "info")
-		}
+		// 完成事件已在事务内落库；此处仅推送 SSE 终态（非落库路径）
 		if rt.existing != nil {
 			rt.stage("done", fmt.Sprintf("修改完成，预览已更新（v%d）🎉", snap.Version))
 		} else {
 			rt.stage("done", fmt.Sprintf("构建完成，预览已就绪（v%d）🎉", snap.Version))
 		}
-		AppendRunMessage(project.ID, brief, userID, "done")
 		return project, nil
 	}
 

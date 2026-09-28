@@ -429,6 +429,76 @@ func TestDemoModeStateMachine(t *testing.T) {
 	var snaps []store.Snapshot
 	store.DB.Where("project_id = ?", p.ID).Find(&snaps)
 	if len(snaps) != 1 {
-		t.Fatalf("demo 模式应有 v1 快照，实际 %d", len(snaps))
+		t.Fatalf("demo 模式应有 v1 快照，实际 %d 条", len(snaps))
 	}
 }
+
+// TestCommitSuccessAtomicity 终态事务原子性：Message 表插入被 trigger 强制失败时，
+// CommitSuccess 必须整体回滚——项目不得置 ready、版本不递增、快照与完成事件均不落库。
+// 这对应"只有源码、Preview、事件和消息均成功落库后才能标记完成"的硬性要求。
+func TestCommitSuccessAtomicity(t *testing.T) {
+	openTestDB(t)
+	uid := newTestUser(t)
+	script := []llm.ToolCall{
+		mkTool("plan_app", planArgs{AppName: "测试应用", Template: "todo"}),
+		mkTool("write_file", writeArgs{Path: "index.html", Content: validHTML}),
+		mkTool("run_checks", map[string]string{}),
+		mkTool("finish", finishArgs{Summary: "完成"}),
+	}
+	ag := newTestAgent(script)
+	p1, err := ag.Run(context.Background(), uid, "做一个待办清单", "build", nil, PipelineEvents{})
+	if err != nil || p1.Version != 1 {
+		t.Fatalf("首轮构建应成功 v1: %v", err)
+	}
+
+	// 在 messages 表上装一个 trigger：拦截 status=done 的插入（模拟消息落库崩溃）
+	if err := store.DB.Exec(`CREATE TRIGGER block_done_msg BEFORE INSERT ON messages
+WHEN NEW.status = 'done' AND NEW.role = 'assistant'
+BEGIN
+  SELECT RAISE(ABORT, 'simulated message write failure');
+END`).Error; err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	// 第二轮 refine 全链成功，但终态事务内 done 消息写入失败 → 必须整体回滚
+	script2 := []llm.ToolCall{
+		mkTool("read_file", pathArgs{Path: "index.html"}),
+		mkTool("edit_file", editArgs{OldString: "</body>", NewString: v2Suffix}),
+		mkTool("run_checks", map[string]string{}),
+		mkTool("finish", finishArgs{Summary: "v2 完成"}),
+	}
+	ag2 := newTestAgent(script2)
+	_, err = ag2.Refine(context.Background(), uid, p1.ID, "加功能", nil, PipelineEvents{})
+	if err == nil {
+		t.Fatal("终态事务失败时 refine 必须返回错误")
+	}
+	var p store.Project
+	store.DB.Where("id = ?", p1.ID).First(&p)
+	if p.Status != "failed" {
+		t.Fatalf("事务回滚后项目应落 failed，实际 %s", p.Status)
+	}
+	if p.Version != 1 {
+		t.Fatalf("事务回滚后版本不得递增（应保持 v1），实际 v%d", p.Version)
+	}
+	if p.HTML != validHTML || p.LastGoodHTML != validHTML {
+		t.Fatal("回滚后 HTML/LastGoodHTML 应保留最后成功版本（v1）")
+	}
+	// 快照不得出现 v2；完成事件不得落库
+	var snaps []store.Snapshot
+	store.DB.Where("project_id = ?", p1.ID).Find(&snaps)
+	if len(snaps) != 1 {
+		t.Fatalf("失败事务不应创建快照（应仅 v1 一条），实际 %d 条", len(snaps))
+	}
+	var doneEvents int64
+	store.DB.Model(&store.Event{}).Where("project_id = ? AND message LIKE ?", p1.ID, "%落库为 v%").Count(&doneEvents)
+	if doneEvents != 1 {
+		t.Fatalf("完成事件应仅首轮一条（v1），实际 %d 条", doneEvents)
+	}
+	// 失败路径的 run 消息（failed）正常落库：trigger 只拦截 done
+	var failedRuns int64
+	store.DB.Model(&store.Message{}).Where("project_id = ? AND role = ? AND status = ?", p1.ID, "assistant", "failed").Count(&failedRuns)
+	if failedRuns != 1 {
+		t.Fatalf("失败轮应有 1 条 failed run 消息，实际 %d 条", failedRuns)
+	}
+}
+

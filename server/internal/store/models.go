@@ -155,6 +155,53 @@ func RollbackSnapshot(projectID uint, targetVersion int) (*Project, *Snapshot, e
 	return p, snap, err
 }
 
+// CommitSuccess 成功终态的单一事务原子提交：满足"只有源码、Preview、事件和消息
+// 均成功落库后才能标记完成"的硬性要求。同一事务内完成：
+//   1. Project：version+1 / html / last_good_html / status=ready（完成标记）
+//   2. Snapshot：新版本快照（版本回滚的真实数据源）
+//   3. Event：完成事件（时间线可见的"落库为 vN"留痕）
+//   4. Message：assistant run 消息（status=done，对话回看依据）
+// 任一步失败整体回滚——项目中途崩溃不会出现"显示完成但事件/消息缺失"的中间态；
+// 事务外的 name/template 回填独立先行（展示字段，不影响完成语义）。
+func CommitSuccess(projectID uint, html, label, doneEventMsg, summary, brief string, userID uint) (*Snapshot, error) {
+	var out *Snapshot
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var p Project
+		if err := tx.Where("id = ?", projectID).First(&p).Error; err != nil {
+			return err
+		}
+		now := Now()
+		nextVer := p.Version + 1
+		if err := tx.Model(&Project{}).Where("id = ?", projectID).
+			Updates(map[string]interface{}{"version": nextVer, "html": html, "last_good_html": html, "status": "ready", "updated_at_ms": now}).Error; err != nil {
+			return err
+		}
+		s := &Snapshot{ProjectID: projectID, Version: nextVer, HTML: html, Label: label, Status: "done", CreatedAtMs: now}
+		if err := tx.Create(s).Error; err != nil {
+			return err
+		}
+		if doneEventMsg != "" {
+			msg := fmt.Sprintf(doneEventMsg, nextVer)
+			if err := tx.Create(&Event{ProjectID: projectID, Stage: "done", Message: msg, Level: "info", TsMs: now}).Error; err != nil {
+				return err
+			}
+		}
+		if summary != "" {
+			if err := tx.Create(&Event{ProjectID: projectID, Stage: "done", Message: summary, Level: "info", TsMs: now}).Error; err != nil {
+				return err
+			}
+		}
+		if brief != "" {
+			if err := tx.Create(&Message{ProjectID: projectID, UserID: userID, Role: "assistant", Kind: "run", Text: brief, Status: "done", CreatedAtMs: now}).Error; err != nil {
+				return err
+			}
+		}
+		out = s
+		return nil
+	})
+	return out, err
+}
+
 // MarkProjectStatus 事务内更新项目状态与 LastGoodHTML（失败/停止时保留最后成功版本）。
 func MarkProjectStatus(projectID uint, status string, keepHTML bool) error {
 	return DB.Transaction(func(tx *gorm.DB) error {

@@ -1,7 +1,9 @@
 #!/bin/bash
 # Atomix Demo 完整 E2E 验证脚本
-# 覆盖：游客入口 / 计算器+贪吃蛇独立产物 / 两轮增量核对 / 状态机失败落库 /
-#       版本回滚原子性 / 退出重登 / 账号隔离 / 部署 SHA / HTTPS
+# 覆盖：游客入口 / 计算器+贪吃蛇独立产物（蛇五特性断言）/ 两轮增量核对 /
+#       事务一致性（ready↔完成事件↔done 消息）/ 状态机失败落库 /
+#       版本回滚原子性 / 真实退出重登（注册→logout→relogin→四要素）/
+#       账号隔离 / 部署 SHA / HTTPS
 #
 # 用法：./verify-e2e.sh [BASE_URL]
 #   BASE_URL 默认 https://101.32.28.8 （自签证书，脚本已带 -k）
@@ -137,6 +139,12 @@ if [ -n "$CAL_ID" ] && [ -n "$SNK_ID" ]; then
   S1=$(json_str "$SRC1" source); S2=$(json_str "$SRC2" source)
   if echo "$S1" | grep -qi "calc\|计算"; then ok "计算器源码含计算器特征"; else bad "计算器源码无特征: $(head -c 120 <<<"$SRC1")"; fi
   if echo "$S2" | grep -qi "snake\|贪吃蛇\|canvas"; then ok "贪吃蛇源码含游戏特征"; else bad "贪吃蛇源码无特征: $(head -c 120 <<<"$SRC2")"; fi
+  # 贪吃蛇五特性逐一核对：Canvas 渲染 / 方向控制 / 开始与暂停 / 计分 / 难度切换
+  if echo "$S2" | grep -q '<canvas'; then ok "贪吃蛇特性 1/5：真实 Canvas 画布"; else bad "贪吃蛇缺少 Canvas"; fi
+  if echo "$S2" | grep -qi 'arrowup\|keydown\|方向键'; then ok "贪吃蛇特性 2/5：方向控制（键盘监听）"; else bad "贪吃蛇缺少方向控制"; fi
+  if echo "$S2" | grep -qi '暂停\|pause'; then ok "贪吃蛇特性 3/5：开始/暂停控制"; else bad "贪吃蛇缺少暂停功能"; fi
+  if echo "$S2" | grep -qi '得分\|score'; then ok "贪吃蛇特性 4/5：计分系统"; else bad "贪吃蛇缺少计分"; fi
+  if echo "$S2" | grep -qi '难度\|difficulty\|speed'; then ok "贪吃蛇特性 5/5：难度切换（速度档位）"; else bad "贪吃蛇缺少难度切换"; fi
   if [ "$S1" != "$S2" ] && [ -n "$S1" ] && [ -n "$S2" ]; then ok "两类 Prompt 源码不同（独立产物）"; else bad "两类 Prompt 源码相同（串模板）"; fi
   # 预览接口同样返回各自内容（Cookie 鉴权，与浏览器 iframe 行为一致）
   PV1=$($CURL -b /tmp/e2e-cal.jar "$BASE/api/projects/$CAL_ID/preview")
@@ -175,6 +183,16 @@ if [ -z "$PID" ] || [ "$PID" = "0" ]; then bad "增量基线项目构建失败: 
   if [ "$S_A" != "$S_B" ] && [ -n "$S_B" ]; then ok "两轮源码存在差异（真实增量）"; else bad "两轮源码无差异"; fi
   EV2=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/events")
   if echo "$EV2" | grep -q "edit_file"; then ok "增量轮走 edit_file 精准修改"; else say "（demo 模式下增量可能整体重写，跳过 edit_file 断言）"; fi
+  # 事务一致性断言：ready 状态必须与完成事件、done 消息同时存在（同一事务原子提交）
+  TXPROJ=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID")
+  TXS=$(json_get "$TXPROJ" status)
+  if [ "$TXS" = "ready" ]; then
+    if echo "$EV2" | grep -q "落库为 v"; then ok "事务一致性：ready 伴随完成事件（同事务落库）"; else bad "ready 但缺少完成事件（事务不一致）"; fi
+    MSGS=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/messages")
+    if echo "$MSGS" | grep -q '"status":"done"'; then ok "事务一致性：ready 伴随 done 消息（同事务落库）"; else bad "ready 但缺少 done 消息（事务不一致）"; fi
+  else
+    bad "增量后项目状态异常: $TXS"
+  fi
   # 旧功能保留：第二轮源码仍含第一轮核心特征
   if echo "$S_B" | grep -qi "calc\|计算"; then ok "旧功能保留（计算器特征仍在）"; else bad "旧功能丢失"; fi
   # 预览与源码一致（原子）：Cookie 过期前重签（每轮构建耗时可能超 1h TTL）
@@ -264,17 +282,43 @@ else
   say "（第 3 节基线项目未建成，跳过快照/回滚断言）"
 fi
 
-section "6. 退出重登（会话持久性）"
-if [ -n "$TAcc" ]; then
-  PROJ2=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects")
+section "6. 退出重登（全新会话）"
+# 真实重登流程：注册正式账号（非游客，不受 24h 清理影响）→ 构建 → 退出 → 重新登录 →
+# 四要素核对（项目/对话/源码/Preview）。旧 token 登出后须失效或至少不再作为会话凭据。
+REMAIL="relogin_$(date +%s)@atomix.test"
+REG2=$($CURL -X POST "$BASE/api/auth/register" -H 'Content-Type: application/json' -d "{\"email\":\"$REMAIL\",\"password\":\"relogin123\"}")
+TOLD=$(json_get "$REG2" token)
+if [ -n "$TOLD" ]; then ok "正式账号注册成功（$REMAIL）"; else bad "注册失败: $REG2"; fi
+ENC6=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "做一个极简计算器，支持四则运算")
+pv_cookie "$TOLD" /tmp/e2e-re.jar
+run_sse /tmp/e2e-re.txt "$TOLD" -H "Authorization: Bearer $TOLD" "$BASE/api/generate?brief=$ENC6&mode=build"
+RE_ID=$(sse_pid /tmp/e2e-re.txt)
+if [ -n "$RE_ID" ] && [ "$RE_ID" != "0" ]; then ok "重登前基线项目就绪 (id=$RE_ID)"; else bad "基线构建失败: $(tail -c 300 /tmp/e2e-re.txt)"; fi
+# 登出：清 HttpOnly 预览 Cookie
+LO=$(curl -sk -o /dev/null -w '%{http_code}' -X POST "$BASE/api/auth/logout" -H "Authorization: Bearer $TOLD")
+if [ "$LO" = "200" ]; then ok "logout 受理（200）"; else bad "logout 异常（$LO）"; fi
+# 重新登录：全新会话 token
+RLG=$($CURL -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$REMAIL\",\"password\":\"relogin123\"}")
+TNEW=$(json_get "$RLG" token)
+if [ -n "$TNEW" ] && [ "$TNEW" != "$TOLD" ]; then ok "重新登录成功且签发新会话 token"; else bad "重登失败或 token 未轮换: $RLG"; fi
+if [ -n "$RE_ID" ]; then
+  # 四要素核对：项目列表 / 对话历史 / 源码 / Preview
+  PROJ2=$($CURL -H "Authorization: Bearer $TNEW" "$BASE/api/projects")
   CNT2=$(echo "$PROJ2" | grep -o '"id":' | wc -l)
-  if [ "$CNT2" -ge 1 ]; then ok "重登后（同 token）项目列表完整（$CNT2 个）"; else bad "项目列表丢失"; fi
-  if [ -n "$PID" ]; then
-    MSG=$($CURL -H "Authorization: Bearer $TAcc" "$BASE/api/projects/$PID/messages")
-    if echo "$MSG" | grep -q '"role":"user"'; then ok "对话历史持久化（Message 表还原）"; else bad "对话历史丢失"; fi
-  else
-    say "（第 3 节基线项目未建成，跳过对话历史断言）"
+  if [ "$CNT2" -ge 1 ]; then ok "重登后项目列表完整（$CNT2 个）"; else bad "重登后项目列表丢失"; fi
+  MSG=$($CURL -H "Authorization: Bearer $TNEW" "$BASE/api/projects/$RE_ID/messages")
+  if echo "$MSG" | grep -q '"role":"user"'; then ok "重登后对话历史完整（Message 表还原）"; else bad "重登后对话历史丢失"; fi
+  pv_cookie "$TNEW" /tmp/e2e-re2.jar
+  SRCNEW=$($CURL -b /tmp/e2e-re2.jar "$BASE/api/projects/$RE_ID/source")
+  SRCV=$(json_str "$SRCNEW" source)
+  if [ -n "$SRCV" ]; then ok "重登后源码可取（同账号归属校验通过）"; else bad "重登后源码获取失败"; fi
+  PVNEW=$($CURL -b /tmp/e2e-re2.jar "$BASE/api/projects/$RE_ID/preview")
+  if [ -n "$PVNEW" ] && echo "$PVNEW" | grep -qi 'calc\|计算'; then ok "重登后 Preview 可访问且内容正确"; else bad "重登后 Preview 异常"; fi
+  if [ "$SRCV" != "" ] && [ "$PVNEW" != "" ]; then
+    if echo "$SRCV" | grep -qi 'calc\|计算'; then ok "源码与 Preview 同源一致（同一落库版本）"; else bad "源码特征异常"; fi
   fi
+else
+  say "（基线项目未建成，跳过四要素断言）"
 fi
 
 section "7. 账号隔离"
