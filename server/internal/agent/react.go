@@ -601,10 +601,9 @@ func (a *Agent) Refine(ctx context.Context, userID, projectID uint, instruction 
 // 迭代修改时（existing 非空）复用同一项目行，事件与产物更新都落在该项目上。
 //
 // 状态机（修复"未校验即完成"）：产物必须满足【写入(write/edit) → 校验通过(run_checks) →
-// 落库(HTML+LastGoodHTML) → 快照(CreateSnapshot)】全链路成功，项目才会进入 ready("完成")；
-// 校验未通过 / 循环失败 / 循环耗尽时项目状态落 failed 并保留 LastGoodHTML（最后成功版本），
-// 预览始终指向可用产物；每轮终态同时落 Message 表（此前 generate/refine 失败轮的
-// 用户消息在 handlers 层重复落库且 projectId 传参错位，统一收敛到这里）。
+// 终态事务(CommitSuccess：源码+快照+完成事件+done消息同事务提交)】全链路成功，
+// 项目才会进入 ready("完成")；校验未通过 / 循环失败 / 事务失败时项目状态落 failed
+// 并保留 LastGoodHTML（最后成功版本），预览始终指向可用产物；每轮终态同时落 Message 表。
 func (rt *reactSession) runProject(ctx context.Context, userID uint, brief, existingName string) (*store.Project, error) {
 	now := store.Now()
 	project := rt.existing
